@@ -1,0 +1,23 @@
+{
+  "name": "通用知识库",
+  "industry": "未选择",
+  "primary_region": "中国",
+  "comparison_regions": [],
+  "timezone": "Asia/Shanghai",
+  "topics": [
+    "政策与监管",
+    "企业与竞争",
+    "产品与技术",
+    "供应链",
+    "市场与财务",
+    "项目与事件",
+    "风险",
+    "背景与术语"
+  ],
+  "lookback_days": 7,
+  "max_new_evidence_per_run": 12,
+  "freshness": {
+    "default_days": 30,
+    "category_days": {}
+  }
+}

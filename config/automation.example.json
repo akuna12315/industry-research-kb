@@ -1,0 +1,7 @@
+{
+  "status": "NOT_CONFIGURED",
+  "schedule": "09:00（需自行配置外部调度）",
+  "configured": false,
+  "timezone": "Asia/Shanghai",
+  "note": "本项目不安装或启动定时任务；行业开关只定义外部调度的采集清单。"
+}

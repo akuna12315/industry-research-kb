@@ -1,0 +1,15 @@
+{
+  "status": "failed",
+  "run_date": "2026-01-15",
+  "coverage_from": "2026-01-09",
+  "coverage_through": "2026-01-15",
+  "queries": [],
+  "sources_accessed": [],
+  "sources_failed": [],
+  "inserted_ids": [],
+  "updated_ids": [],
+  "unchanged_ids": [],
+  "uncovered_ranges": [{"from": "2026-01-09", "through": "2026-01-15", "reason": "示例，未执行调查"}],
+  "open_questions": [],
+  "next_focus": "替换为下一轮真实调查重点；不能将此示例当作已执行记录"
+}

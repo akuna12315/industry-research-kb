@@ -1,0 +1,6 @@
+{
+  "provider": "ddgs",
+  "backend": "bing",
+  "searxng_url": "",
+  "region": "cn-zh"
+}

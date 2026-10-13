@@ -1,0 +1,1 @@
+"""Local Industry Atlas application."""

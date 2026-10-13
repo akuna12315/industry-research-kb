@@ -1,0 +1,24 @@
+# Local knowledge and research configuration
+config/*.json
+!config/*.example.json
+industries/
+evidence/
+history/
+topics/
+reports/
+data/
+logs/
+work/
+# Credentials, environments and caches
+.env
+.env.*
+*.pem
+*.key
+*secrets*.json
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.sqlite*
+*.db
+.DS_Store

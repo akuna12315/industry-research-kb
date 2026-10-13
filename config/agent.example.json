@@ -1,0 +1,12 @@
+{
+  "provider_id": "openai-compatible",
+  "display_name": "待配置模型",
+  "base_url": "https://api.example.com/v1",
+  "protocol": "chat_completions",
+  "model": "your-model-id",
+  "api_key_env": "KB_MODEL_API_KEY",
+  "request_limit": 16,
+  "timeout_seconds": 300,
+  "scheduler_enabled": false,
+  "daily_time": "09:00"
+}

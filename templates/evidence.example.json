@@ -1,0 +1,21 @@
+{
+  "id": "replace-with-stable-id",
+  "title": "替换为事实或公告标题",
+  "summary": "基于读到的原文撰写简明摘要；不要写推测或编造数字。",
+  "url": "https://example.org/original-source",
+  "publisher": "发布机构",
+  "source_id": null,
+  "published_date": null,
+  "event_date": null,
+  "checked_date": "2026-01-15",
+  "review_after": null,
+  "valid_until": null,
+  "superseded_by": null,
+  "region": "中国",
+  "category": "政策与标准",
+  "status": "needs_verification",
+  "source_type": "primary",
+  "tags": ["替换为行业或主题标签"],
+  "limitations": "填写适用范围、来源限制及尚需交叉核验的事项。",
+  "metrics": []
+}
