@@ -14,7 +14,7 @@ Windows PowerShell，在仓库根目录运行：
 powershell -ExecutionPolicy Bypass -File .\start-web.ps1
 ```
 
-脚本创建仓库内 `.venv`、安装固定版本依赖，并由 `scripts/init_workspace.py` 从模板生成本地配置；已有配置不覆盖。打开 http://127.0.0.1:8765/。服务仅监听本机。
+脚本创建仓库内 `.venv`、安装固定版本依赖，并由 `scripts/init_workspace.py` 从模板生成本地配置；已有配置不覆盖。打开 [本地页面](http://127.0.0.1:8765/)。服务仅监听本机。
 
 也可手动启动（跨平台）：
 
