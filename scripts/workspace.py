@@ -9,6 +9,7 @@ import re
 from urllib.parse import urlsplit
 
 import kb
+import professions
 
 DEFAULT_CATEGORIES = ['政策与监管', '企业与竞争', '产品与技术', '供应链', '市场与财务', '项目与事件', '风险', '背景与术语']
 FRESHNESS_LABELS = {'current': '未到复核期限', 'review_due': '待复核',
@@ -149,6 +150,10 @@ def validate_scope(config):
     for value in [policy.get('default_days', 30), *policy.get('category_days', {}).values()]:
         if type(value) is not int or not 1 <= value <= 36500:
             raise ValueError('复核周期必须为1至36500天')
+    if 'research_regions' in config:
+        config['research_regions'] = professions.regions(config)
+    if not isinstance(config.get('comparison_regions', []), list) or any(not isinstance(r, str) or not r.strip() for r in config.get('comparison_regions', [])):
+        raise ValueError('对照地区应为地区名称数组')
     return config
 
 
@@ -170,11 +175,16 @@ def industry_command(root, args):
                 'topics': args.categories or DEFAULT_CATEGORIES, 'lookback_days': 7,
                 'max_new_evidence_per_run': 12, 'weekly_deep_dive_day': 'Monday',
                 'freshness': {'default_days': 30, 'category_days': {}}})
+            forestry = getattr(args, 'specialty', None) == 'forestry'
+            if forestry:
+                settings.update(specialty='forestry', query_template='forestry-v1', research_regions=[args.region],
+                                topics=args.categories or professions.FORESTRY_TOPICS,
+                                freshness={'default_days': 30, 'category_days': {'技术标准': 90, '政策法规与规划': 60, '资源调查与空间资料': 365}})
             for folder in ('evidence', 'history', 'topics', 'reports/updates', 'reports/briefs', 'work', 'data'):
                 (home / folder).mkdir(parents=True, exist_ok=True)
             kb.atomic_write(home / 'config/scope.json', kb.json_text(settings))
-            kb.atomic_write(home / 'config/sources.json', kb.json_text({'sources': [], 'discovery_domains': [], 'mode': 'preferred'}))
-            kb.atomic_write(home / 'config/queries.json', kb.json_text({category: [f'{args.name} {category} 官方'] for category in settings['topics']}))
+            kb.atomic_write(home / 'config/sources.json', kb.json_text(professions.national_sources() if forestry else {'sources': [], 'discovery_domains': [], 'mode': 'preferred'}))
+            kb.atomic_write(home / 'config/queries.json', kb.json_text(professions.forestry_queries(settings) if forestry else {category: [f'{args.name} {category} 官方'] for category in settings['topics']}))
             kb.atomic_write(home / 'README.md', f'# {args.name}行业档案\n\n地区：{args.region}。尚无证据；信息来源待指定或公开发现。\n')
             for index, category in enumerate(settings['topics'], 1):
                 kb.atomic_write(home / f'topics/{index:02d}.md', f'# {category}\n\n尚无经核验资料。调查问题：关键事实、统计口径和原始来源是什么？\n')
@@ -240,6 +250,7 @@ def brief(root, entries, args):
             lines.extend([f'## {key[0]} / {key[1]}', ''])
             group = key
         lines.extend([f'### {record["title"]}', '', record['summary'], '',
+            f'- 资料适用地区：{record.get("region") or "未填写，须核对"}',
             f'- 事实状态：{kb.LABELS[record["status"]]}；时效：{record["freshness_label"]}',
             f'- 发布：{record.get("published_date") or "未明确"}；事件：{record.get("event_date") or "未明确"}；核验：{record["checked_date"]}；复核期限：{record["review_due_date"]}',
             f'- [本地证据](../../{record["path"]}) · [原始来源]({record["url"]})',
@@ -385,6 +396,7 @@ def run_cli():
     create.add_argument('name')
     create.add_argument('--region', default='中国')
     create.add_argument('--categories', nargs='+')
+    create.add_argument('--specialty', choices=['forestry'])
     for action in ('use', 'enable', 'disable'):
         industry.add_parser(action).add_argument('id')
     sources = commands.add_parser('source').add_subparsers(dest='action', required=True)
@@ -423,7 +435,12 @@ def run_cli():
             if not isinstance(changes, dict):
                 raise ValueError('范围配置必须是JSON对象')
             with kb.lock(root):
-                updated = validate_scope({**scope(home), **changes})
+                old = scope(home)
+                updated = {**old, **changes}
+                if 'primary_region' in changes and 'research_regions' not in changes:
+                    updated['research_regions'] = [changes['primary_region']]
+                updated = validate_scope(updated)
+                professions.sync_queries(home, old, updated, kb)
                 kb.atomic_write(home / 'config/scope.json', kb.json_text(updated))
             result = updated
         elif args.command == 'import':

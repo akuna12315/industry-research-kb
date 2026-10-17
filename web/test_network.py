@@ -8,7 +8,7 @@ from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolRetu
 
 from .test_web import Fixture
 from .network import NetworkRuntime, Robots, canonical_url
-from .agent_runtime import fetch_page, public_url, build_agent, ResearchContext
+from .agent_runtime import fetch_page, public_url, build_agent, ResearchContext, AgentRuntime
 from .service import kb
 
 
@@ -25,6 +25,80 @@ class NetworkTests(Fixture, unittest.IsolatedAsyncioTestCase):
         return {'url': url, 'requested_url': url, 'title': '测试页面', 'text': text,
                 'truncated': False, 'links': [{'url': u, 'title': u} for u in links or []],
                 'checked_date': self.record['checked_date']}
+
+    async def test_cached_crawl_respects_changed_source_boundary(self):
+        url = self.record['url']
+        crawl = await self.batch([url], max_pages=1, max_depth=0,
+                                 fetch=AsyncMock(return_value=self.page(url)))
+        self.store.save_sources('alpha', {'mode': 'only', 'sources': [{'id': 'official', 'name': '限定来源',
+            'url': 'https://official.example/public/', 'enabled': True, 'priority': 1, 'categories': []}]})
+        calls = 0
+        def model(messages, info):
+            nonlocal calls
+            calls += 1
+            parts = [ToolCallPart('read_public_source', {'url': url}, tool_call_id='read'),
+                ToolCallPart('archive_evidence', {'record': {**self.record, 'id': 'outside-cache'}}, tool_call_id='archive'),
+                TextPart('来源边界已改变。')]
+            return ModelResponse(parts=[parts[min(calls - 1, 2)]])
+        runtime = AgentRuntime(self.store, self.network)
+        job = {'id': kb.uuid4().hex, 'conversation': kb.uuid4().hex, 'industry': 'alpha', 'research': True,
+               'crawl_id': crawl['id'], 'status': 'running', 'events': [], 'started_at': kb.now()}
+        with patch('web.agent_runtime.fetch_page', new=AsyncMock()) as fetch:
+            await runtime.run(job, '整理候选', model_override=FunctionModel(model))
+        fetch.assert_not_awaited()
+        self.assertFalse((self.store.home('alpha') / 'evidence/outside-cache.json').exists())
+
+    async def test_long_page_tail_change_changes_fingerprint(self):
+        client = httpx.AsyncClient
+        tail = 'OLD'
+        def handler(request):
+            return httpx.Response(200, text='<main>' + 'x' * 20000 + tail + '</main>',
+                                  headers={'Content-Type': 'text/html'})
+        with patch('web.agent_runtime.public_url', new=AsyncMock(return_value=None)), \
+             patch.object(self.network.robots, 'check', new=AsyncMock()), \
+             patch('web.agent_runtime.httpx.AsyncClient', lambda **kw: client(transport=httpx.MockTransport(handler), **kw)):
+            first = await self.network.crawl('alpha', ['https://example.org/long'], max_pages=1, max_depth=0)
+            tail = 'CHANGED'
+            second = await self.network.crawl('alpha', ['https://example.org/long'], max_pages=1, max_depth=0)
+        self.assertTrue(second['items'][0]['truncated'])
+        self.assertEqual(second['items'][0]['state'], 'changed')
+        self.assertNotEqual(first['items'][0]['hash'], second['items'][0]['hash'])
+
+    async def test_industry_new_budget_allows_revision_but_rejects_second_new_fact(self):
+        self.store.save_scope('alpha', {'max_new_evidence_per_run': 1})
+        calls = 0
+        def model(messages, info):
+            nonlocal calls
+            calls += 1
+            ids = ['budget-one', self.record['id'], 'budget-two']
+            part = ToolCallPart('archive_evidence', {'record': {**self.record, 'id': ids[calls - 1],
+                'summary': '本轮修订资料'}}, tool_call_id=str(calls)) if calls <= 3 else TextPart('遵守新增上限。')
+            return ModelResponse(parts=[part])
+        ctx = ResearchContext(self.store, 'alpha', True, pages={self.record['url']: self.page(self.record['url'])})
+        await build_agent(FunctionModel(model)).run('归档', deps=ctx)
+        self.assertEqual(ctx.new_ids, {'budget-one'})
+        self.assertEqual(len(ctx.imported_ids), 2)
+        self.assertFalse((self.store.home('alpha') / 'evidence/budget-two.json').exists())
+        self.assertEqual(kb.read_json(self.store.home('alpha') / 'evidence' / (self.record['id'] + '.json'))['summary'], '本轮修订资料')
+
+    async def test_agent_single_reader_obeys_robots_disallow(self):
+        client = httpx.AsyncClient
+        paths = []
+        def handler(request):
+            paths.append(request.url.path)
+            return httpx.Response(200, text='User-agent: *\nDisallow: /private')
+        calls = 0
+        def model(messages, info):
+            nonlocal calls
+            calls += 1
+            return ModelResponse(parts=[ToolCallPart('read_public_source', {'url': 'https://example.org/private/a'},
+                tool_call_id='read') if calls == 1 else TextPart('禁止采集。')])
+        ctx = ResearchContext(self.store, 'alpha', True, network=self.network)
+        with patch('web.agent_runtime.public_url', new=AsyncMock(return_value=None)), \
+             patch('web.agent_runtime.httpx.AsyncClient', lambda **kw: client(transport=httpx.MockTransport(handler), **kw)):
+            await build_agent(FunctionModel(model)).run('读取', deps=ctx)
+        self.assertEqual(paths, ['/robots.txt'])
+        self.assertEqual(ctx.pages, {})
 
     async def fake_fetch(self, url, catalog, guard=None):
         if guard:

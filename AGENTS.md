@@ -13,4 +13,6 @@
 - 研究归档仅限用户选定单行业；先读原文并过验证再归档，单源不强标confirmed。正文暂存内存，保留原创摘要和链接。
 - 密钥仅服务内存或用户环境变量，不读回、不输出、不写文件、命令参数、报告或浏览器存储。配置用户接口时保留最新选择，重启前告知密钥需重填。
 - 公共提交只包含源码、测试与通用模板，不提交实际config JSON、行业资料、证据、报告、日志、截图、数据库、工作目录或.env。不得使用git add -f绕过保护。
-- 验证：先python scripts/init_workspace.py，再python -m unittest web.test_web web.test_network，及python -m unittest discover -s scripts -p 'test_*.py'。
+- 验证：先python scripts/init_workspace.py，再python -m unittest web.test_web web.test_network web.test_knowledge web.test_regions web.test_docx_index，及python -m unittest discover -s scripts -p 'test_*.py'。
+
+- 专业资料、原附件、全文索引、偏好记忆及历史对话仅留本地；默认内部且不授权模型，restricted 不可授权。全国依据共享时保留原所属档案，地方资料不跨地区自动套用。

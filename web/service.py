@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 import kb
 import workspace as ws
+import professions
 
 
 class Store:
@@ -45,8 +46,18 @@ class Store:
                 'automation': kb.read_json(self.root / 'config/automation.json'),
                 'write_locked': (self.root / 'data/write.lock').exists()}
 
-    def evidence(self, industry='all', query='', **filters):
+    def research_entries(self, industry, include_shared=True):
         entries = ws.selected(self.root, industry, many=True)
+        if industry != 'all' and include_shared:
+            settings = ws.scope(self.home(industry))
+            if settings.get('specialty') == 'forestry' and settings.get('library_role') != 'national-foundation':
+                entries += [e for e in ws.registry(self.root)['industries'] if e['id'] != industry
+                            and ws.scope(ws.profile_path(self.root, e)).get('library_role') == 'national-foundation'
+                            and ws.scope(ws.profile_path(self.root, e)).get('specialty') == 'forestry']
+        return entries
+
+    def evidence(self, industry='all', query='', include_shared=False, **filters):
+        entries = self.research_entries(industry, include_shared)
         args = self.args(**filters)
         if query.strip():
             args.query = query.strip()
@@ -95,7 +106,12 @@ class Store:
     def save_scope(self, industry, changes):
         home = self.home(industry)
         with kb.lock(self.root):
-            updated = ws.validate_scope({**ws.scope(home), **changes})
+            old = ws.scope(home)
+            updated = {**old, **changes}
+            if 'primary_region' in changes and 'research_regions' not in changes:
+                updated['research_regions'] = [changes['primary_region']]
+            updated = ws.validate_scope(updated)
+            professions.sync_queries(home, old, updated, kb)
             kb.atomic_write(home / 'config/scope.json', kb.json_text(updated))
             for index, category in enumerate(updated['topics'], 1):
                 filename = f'{index:02d}-' + kb.hashlib.sha256(category.encode()).hexdigest()[:8] + '.md'

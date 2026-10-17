@@ -242,7 +242,7 @@ class NetworkRuntime:
                             if attempt:
                                 raise
                             await asyncio.sleep(1)
-                    digest = hashlib.sha256(page['text'].encode('utf-8')).hexdigest()
+                    digest = page.get('content_hash') or hashlib.sha256(page['text'].encode('utf-8')).hexdigest()
                     canonical = canonical_url(page['url'])
                     previous = old.get(canonical, {})
                     known_duplicate = any(v.get('hash') == digest and k != canonical for k, v in old.items())

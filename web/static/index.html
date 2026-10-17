@@ -5,7 +5,7 @@
   <title>研知 · 行业知识库</title>
   <meta name="description" content="可追溯的行业研究、信息来源管理与智能调查助手">
   <link rel="stylesheet" href="/static/style.css">
-  <script src="/static/app.js" defer></script>
+  <script src="/static/app.js?v=20261017-docx" defer></script>
 </head>
 <body>
 <div class="app-shell">
@@ -13,6 +13,8 @@
     <a class="brand" href="/" aria-label="研知首页"><span class="brand-icon">研</span><span>研知<small>INDUSTRY ATLAS</small></span></a>
     <div class="workspace-label">我的研究空间 <span>LOCAL</span></div>
     <nav aria-label="主要导航">
+      <button class="nav-item" data-view="forestry"><span class="nav-icon">♧</span>林草工作台</button>
+      <button class="nav-item" data-view="materials"><span class="nav-icon">▥</span>专业资料</button>
       <button class="nav-item active" data-view="evidence"><span class="nav-icon">▤</span>证据库<span id="nav-count" class="count">0</span></button>
       <button class="nav-item" data-view="industries"><span class="nav-icon">◫</span>行业与范围</button>
       <button class="nav-item" data-view="sources"><span class="nav-icon">⌁</span>信息来源</button>
@@ -20,6 +22,7 @@
       <button class="nav-item" data-view="crawls"><span class="nav-icon">↧</span>批量采集</button>
       <button class="nav-item" data-view="review"><span class="nav-icon">◷</span>待复核<span id="review-count" class="count">0</span></button>
       <button class="nav-item" data-view="reports"><span class="nav-icon">▧</span>报告与记录</button>
+      <button class="nav-item" data-view="memory"><span class="nav-icon">◇</span>记忆与对话</button>
     </nav>
     <div class="sidebar-note"><span class="note-mark">↗</span><strong>让研究有据可循</strong><p>每条事实保留来源、核验日期和修改历史。</p></div>
     <div class="sidebar-bottom"><button class="nav-item" data-view="settings"><span class="nav-icon">⚙</span>Agent 设置</button><div class="local-status"><span class="dot"></span>本地知识库 <span id="server-date"></span></div></div>

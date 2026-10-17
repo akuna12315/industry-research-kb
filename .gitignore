@@ -2,6 +2,7 @@
 config/*.json
 !config/*.example.json
 industries/
+materials/
 evidence/
 history/
 topics/

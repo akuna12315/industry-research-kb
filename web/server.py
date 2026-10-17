@@ -5,8 +5,9 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -15,8 +16,39 @@ from pydantic import BaseModel, Field
 from .service import Store, kb, ws
 from .agent_runtime import AgentRuntime
 from .network import NetworkRuntime
+from .knowledge import Knowledge, KINDS, STATES
 
 WEB = Path(__file__).resolve().parent
+
+
+class BodyLimit:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] != 'http' or scope['method'] not in ('POST', 'PUT', 'PATCH'):
+            return await self.app(scope, receive, send)
+        limit = 12_000_000 if scope['path'].startswith('/api/materials/') and scope['path'].endswith('/upload') else 1_000_000
+        chunks, size = [], 0
+        while True:
+            message = await receive()
+            if message['type'] == 'http.disconnect':
+                return
+            chunk = message.get('body', b'')
+            size += len(chunk)
+            if size > limit:
+                return await JSONResponse({'detail': '请求超过大小上限'}, status_code=413)(scope, receive, send)
+            chunks.append(chunk)
+            if not message.get('more_body', False):
+                break
+        delivered = False
+        async def replay():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {'type': 'http.request', 'body': b''.join(chunks), 'more_body': False}
+            return await receive()
+        return await self.app(scope, replay, send)
 
 
 class IndustryCreate(BaseModel):
@@ -24,6 +56,7 @@ class IndustryCreate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     region: str = Field(default='中国', min_length=1, max_length=100)
     categories: list[str] | None = None
+    specialty: Literal['forestry'] | None = None
 
 
 class AgentRequest(BaseModel):
@@ -39,6 +72,7 @@ def create_app(root=None):
     store = Store(root) if root else Store()
     network = NetworkRuntime(store)
     runtime = AgentRuntime(store, network)
+    knowledge = Knowledge(store)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -54,7 +88,9 @@ def create_app(root=None):
     app.state.store = store
     app.state.runtime = runtime
     app.state.network = network
+    app.state.knowledge = knowledge
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=['127.0.0.1', 'localhost', '[::1]', 'testserver'])
+    app.add_middleware(BodyLimit)
 
     @app.middleware('http')
     async def local_request(request, call_next):
@@ -65,8 +101,12 @@ def create_app(root=None):
             if origin and origin.rstrip('/') != str(request.base_url).rstrip('/'):
                 return JSONResponse({'detail': '拒绝跨站写入'}, status_code=403)
             length = request.headers.get('content-length')
-            if length and int(length) > 1_000_000:
-                return JSONResponse({'detail': '请求过大'}, status_code=413)
+            if length:
+                try:
+                    if int(length) < 0:
+                        raise ValueError()
+                except ValueError:
+                    return JSONResponse({'detail': '请求长度格式无效'}, status_code=400)
         response = await call_next(request)
         response.headers['X-Content-Type-Options'] = 'nosniff'
         response.headers['Referrer-Policy'] = 'no-referrer'
@@ -89,7 +129,60 @@ def create_app(root=None):
 
     @app.get('/api/state')
     def state():
-        return {**store.state(), 'agent': runtime.public_config(), 'network': network.config()}
+        return {**store.state(), 'agent': runtime.public_config(), 'network': network.config(),
+                'knowledge': knowledge.settings(), 'material_kinds': KINDS, 'material_states': STATES}
+
+    @app.get('/api/materials')
+    def materials(industry: str = 'all', q: str = '', kind: str = ''):
+        return [{k: v for k, v in r.items() if k != 'content'} for r in knowledge.list(industry, q, kind)]
+
+    @app.post('/api/materials/{industry}')
+    def material_save(industry: str, payload: dict):
+        return knowledge.save(industry, payload)
+
+    @app.get('/api/materials/{industry}/{key}')
+    def material_get(industry: str, key: str):
+        return knowledge.display(knowledge.get(industry, key))
+
+    @app.post('/api/materials/{industry}/{key}/upload')
+    async def material_upload(industry: str, key: str, file: UploadFile = File(...)):
+        raw = await file.read(10_000_001)
+        await file.close()
+        try:
+            return await asyncio.to_thread(knowledge.upload, industry, key, file.filename or 'document.txt', raw)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError('文档无法提取（' + type(exc).__name__ + '），请检查文件格式或使用文字版') from None
+
+    @app.get('/api/materials/{industry}/{key}/file')
+    def material_file(industry: str, key: str):
+        path, name = knowledge.attachment(industry, key)
+        return FileResponse(path, filename=name)
+
+    @app.get('/api/materials/{industry}/{key}/sections')
+    def material_sections(industry:str,key:str,q:str='',offset:int=0,limit:int=5):
+        return knowledge.sections(industry,key,q,offset,limit)
+
+    @app.get('/api/memories')
+    def memories(industry: str = 'all'):
+        return knowledge.memories(industry)
+
+    @app.post('/api/memories')
+    def memory_save(payload: dict):
+        return knowledge.save_memory(payload)
+
+    @app.post('/api/memories/{key}/archive')
+    def memory_archive(key: str):
+        return knowledge.archive_memory(key)
+
+    @app.put('/api/knowledge/settings')
+    def knowledge_settings(payload: dict):
+        return knowledge.save_settings(payload)
+
+    @app.get('/api/conversations')
+    def conversations(industry: str = 'all'):
+        return knowledge.conversations(industry)
 
     @app.put('/api/network/config')
     def network_config(payload: dict):
@@ -122,9 +215,11 @@ def create_app(root=None):
 
     @app.get('/api/evidence')
     def evidence(industry: str = 'all', q: str = '', category: str | None = None, freshness: str | None = None,
-                 status: str | None = None, tag: str | None = None, source_id: str | None = None, review_only: bool = False):
+                 status: str | None = None, tag: str | None = None, source_id: str | None = None, review_only: bool = False,
+                 include_shared: bool = True):
         return store.evidence(industry, q, category=category or None, freshness=freshness or None,
-                              status=status or None, tag=tag or None, source_id=source_id or None, review_only=review_only, limit=100)
+                              status=status or None, tag=tag or None, source_id=source_id or None, review_only=review_only, limit=100,
+                              include_shared=include_shared)
 
     @app.get('/api/evidence/{industry}/{evidence_id}')
     def record(industry: str, evidence_id: str):
@@ -188,7 +283,7 @@ def create_app(root=None):
 
     @app.post('/api/reports')
     def create_report(payload: dict):
-        result = ws.brief(store.root, ws.selected(store.root, payload.get('industry', 'all'), many=True),
+        result = ws.brief(store.root, store.research_entries(payload.get('industry', 'all')),
                           store.args(query=payload.get('query') or None))
         result['path'] = Path(result['path']).relative_to(store.root).as_posix()
         return result
