@@ -1,6 +1,8 @@
 import asyncio
 from datetime import timedelta
+import hashlib
 import io
+import json
 import unittest
 import zipfile
 
@@ -29,6 +31,174 @@ class KnowledgeTests(Fixture, unittest.TestCase):
     def material(self, **changes):
         return self.knowledge.save('alpha', {'title': '造林技术规程', 'kind': 'standard',
             'number': 'GB/T 15776-2023', 'content': '资料正文：造林作业设计依据，需要核验引用版本。', **changes})
+
+    def import_file(self, metadata, filename, raw):
+        serialized=metadata if isinstance(metadata,str) else json.dumps(metadata,ensure_ascii=False)
+        return self.client.post('/api/materials/alpha/import',data={'metadata':serialized},
+            files={'file':(filename,raw,'application/octet-stream')})
+
+    @staticmethod
+    def import_docx_bytes(text):
+        raw=io.BytesIO()
+        with zipfile.ZipFile(raw,'w',compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr('word/document.xml',
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>'+text+'</w:t></w:r></w:p></w:body></w:document>')
+        return raw.getvalue()
+
+    def assert_import_absent(self,key):
+        folder=self.knowledge.folder('alpha')
+        self.assertFalse((folder/(key+'.json')).exists())
+        self.assertEqual(list((folder/'history'/key).glob('*.json')),[])
+
+    def material_file_snapshot(self):
+        folder=self.knowledge.folder('alpha')
+        return {path.relative_to(folder):path.read_bytes() for path in folder.rglob('*') if path.is_file()}
+
+    def test_atomic_import_broken_docx_does_not_create_record_or_history(self):
+        for metadata in ({'id':'atomic-broken','title':'坏附件不应建目录'}, {'title':'自动ID坏附件不应建目录'}):
+            with self.subTest(metadata=metadata):
+                before=set(self.knowledge.folder('alpha').glob('*.json'))
+                response=self.import_file(metadata,'broken.docx',b'not a DOCX archive')
+                self.assertEqual(response.status_code,400,response.text)
+                self.assertEqual(set(self.knowledge.folder('alpha').glob('*.json')),before)
+                if metadata.get('id'):
+                    self.assert_import_absent(metadata['id'])
+
+    def test_atomic_import_invalid_metadata_does_not_create_record_or_history(self):
+        for suffix,raw in (('.txt',b'synthetic original'),('.docx',self.import_docx_bytes('原文已解析但元数据无效'))):
+            for kind,changes in (('empty',{'title':''}),('restricted',{'title':'受限资料','sensitivity':'restricted','model_allowed':True})):
+                key='atomic-invalid-'+kind+suffix.replace('.','-')
+                with self.subTest(key=key):
+                    before_files=self.material_file_snapshot()
+                    response=self.import_file({'id':key,**changes},'original'+suffix,raw)
+                    self.assertEqual(response.status_code,400,response.text)
+                    self.assert_import_absent(key)
+                    self.assertEqual(self.material_file_snapshot(),before_files,
+                        'failed metadata must not leave an original, index, history or staging file')
+
+    def test_atomic_import_failed_replacement_keeps_existing_json_original_index_and_history(self):
+        key='atomic-preserve'
+        first=self.import_file({'id':key,'title':'第一版标题','version':'v1','model_allowed':True},
+            'v1.docx',self.import_docx_bytes('第一版独有原文与表述'))
+        self.assertEqual(first.status_code,200,first.text)
+        record=first.json()
+        folder=self.knowledge.folder('alpha')
+        metadata=folder/(key+'.json')
+        original=folder/'files'/record['attachment']['storage_name']
+        index=folder/record['extraction']['text_index']
+        tracked={path:path.read_bytes() for path in (metadata,original,*index.parent.glob('*.json'))}
+        before_history={path:path.read_bytes() for path in (folder/'history'/key).glob('*.json')}
+        before_files=self.material_file_snapshot()
+        for name,changes,raw in (
+            ('broken-docx',{'title':'第二版标题','version':'v2','summary':'不应保存'},b'broken DOCX'),
+            ('invalid-metadata',{'title':'','version':'v2','notes':'不应保存'},self.import_docx_bytes('第二版不应发布的原文')),
+        ):
+            with self.subTest(name=name):
+                response=self.import_file({'id':key,**changes},'v2.docx',raw)
+                self.assertEqual(response.status_code,400,response.text)
+                self.assertEqual({path:path.read_bytes() for path in tracked},tracked)
+                self.assertEqual({path:path.read_bytes() for path in (folder/'history'/key).glob('*.json')},before_history)
+                self.assertEqual(self.material_file_snapshot(),before_files)
+                self.assertEqual(self.knowledge.get('alpha',key)['version'],'v1')
+                old_hit=self.knowledge.search('alpha','第一版独有原文')
+                self.assertEqual(len(old_hit),1)
+                self.assertIn('第一版独有原文',old_hit[0]['snippets'][0]['text'])
+                self.assertEqual(self.knowledge.search('alpha','第二版不应发布的原文'),[])
+
+    def test_atomic_import_txt_create_replace_preserves_original_and_metadata_history(self):
+        key='atomic-text'
+        first_raw='第一版文字独有词'.encode()
+        first=self.import_file({'id':key,'title':'第一版资料','version':'v1'},'v1.txt',first_raw)
+        self.assertEqual(first.status_code,200,first.text)
+        record=first.json()
+        self.assertEqual(record['sensitivity'],'internal')
+        self.assertFalse(record['model_allowed'])
+        original,_=self.knowledge.attachment('alpha',key)
+        self.assertEqual(self.client.get('/api/materials/alpha/'+key+'/file').content,first_raw)
+        second_raw='第二版文字独有词'.encode()
+        second=self.import_file({'id':key,'title':'第二版资料','version':'v2'},'v2.txt',second_raw)
+        self.assertEqual(second.status_code,200,second.text)
+        revised=second.json()
+        self.assertEqual(revised['title'],'第二版资料')
+        self.assertEqual(revised['version'],'v2')
+        self.assertEqual(revised['attachment']['sha256'],hashlib.sha256(second_raw).hexdigest())
+        self.assertEqual(original.read_bytes(),first_raw)
+        self.assertEqual(self.client.get('/api/materials/alpha/'+key+'/file').content,second_raw)
+        history=[kb.read_json(path) for path in (self.knowledge.folder('alpha')/'history'/key).glob('*.json')]
+        self.assertEqual(len(history),1)
+        self.assertEqual(history[0]['version'],'v1')
+        self.assertEqual(history[0]['attachment'],record['attachment'])
+        self.assertEqual(len(self.knowledge.list('alpha','第二版文字独有词')),1)
+        self.assertEqual(self.knowledge.list('alpha','第一版文字独有词'),[])
+
+    def test_atomic_import_docx_create_replace_commits_new_index_and_retains_old(self):
+        key='atomic-docx'
+        first_raw=self.import_docx_bytes('旧版可定位正文')
+        first=self.import_file({'id':key,'title':'旧版DOCX','version':'v1','model_allowed':True},'v1.docx',first_raw)
+        self.assertEqual(first.status_code,200,first.text)
+        before=first.json()
+        second_raw=self.import_docx_bytes('新版可定位正文')
+        second=self.import_file({'id':key,'title':'新版DOCX','version':'v2'},'v2.docx',second_raw)
+        self.assertEqual(second.status_code,200,second.text)
+        after=second.json()
+        self.assertEqual(after['title'],'新版DOCX')
+        self.assertEqual(after['version'],'v2')
+        self.assertNotEqual(after['extraction']['text_index'],before['extraction']['text_index'])
+        folder=self.knowledge.folder('alpha')
+        self.assertTrue((folder/before['extraction']['text_index']).is_file())
+        self.assertEqual((folder/'files'/before['attachment']['storage_name']).read_bytes(),first_raw)
+        self.assertEqual(self.client.get('/api/materials/alpha/'+key+'/file').content,second_raw)
+        parts=self.client.get('/api/materials/alpha/'+key+'/sections',params={'q':'新版可定位正文'}).json()
+        self.assertEqual(parts['total'],1)
+        self.assertIn('正文·段落1',parts['items'][0]['first_location'])
+        self.assertEqual(self.knowledge.search('alpha','旧版可定位正文'),[])
+        self.assertIn('新版可定位正文',self.knowledge.search('alpha','新版可定位正文')[0]['snippets'][0]['text'])
+        history=[kb.read_json(path) for path in (folder/'history'/key).glob('*.json')]
+        self.assertEqual(len(history),1)
+        self.assertEqual(history[0]['version'],'v1')
+
+    def test_atomic_import_file_size_checks_attachment_without_counting_multipart_overhead(self):
+        response=self.import_file({'id':'atomic-too-large','title':'超过上传限额'},'large.tif',b'x'*10_000_001)
+        self.assertEqual(response.status_code,400,response.text)
+        self.assert_import_absent('atomic-too-large')
+        response=self.import_file({'id':'atomic-at-limit','title':'恰好上传限额'},'limit.tif',b'x'*10_000_000)
+        self.assertEqual(response.status_code,200,response.text)
+        self.assertIn('未做OCR',response.json()['extraction']['note'])
+
+    def test_atomic_import_rejects_invalid_json_and_top_level_arrays(self):
+        for serialized in ('{', '[]', '[{"title":"不能以数组导入"}]', 'null', 'true', '"string"'):
+            with self.subTest(serialized=serialized):
+                before=set(self.knowledge.folder('alpha').glob('*.json'))
+                response=self.import_file(serialized,'small.txt',b'original')
+                self.assertEqual(response.status_code,400,response.text)
+                self.assertEqual(set(self.knowledge.folder('alpha').glob('*.json')),before)
+        serialized=' '*1_000_001+'{}'
+        response=self.import_file(serialized,'small.txt',b'original')
+        self.assertEqual(response.status_code,400,response.text)
+        self.assertIn('大小上限',response.json()['detail'])
+
+    def test_atomic_import_rejects_invalid_metadata_arrays_without_publishing(self):
+        for key,changes in (
+            ('atomic-tags-type',{'tags':'not-an-array'}),
+            ('atomic-tags-size',{'tags':['x'*101]}),
+            ('atomic-related-type',{'related_evidence_ids':{}}),
+            ('atomic-related-missing',{'related_evidence_ids':['missing-evidence']}),
+        ):
+            with self.subTest(key=key):
+                response=self.import_file({'id':key,'title':'数组边界',**changes},'small.txt',b'original')
+                self.assertEqual(response.status_code,400,response.text)
+                self.assert_import_absent(key)
+
+    def test_atomic_import_nontext_replacement_preserves_omitted_content(self):
+        record=self.material(id='atomic-image',content='应保留的原目录说明')
+        response=self.import_file({'id':record['id'],'title':'新图像标题','version':'v2','notes':'仅改附件说明'},
+            'image.png',b'synthetic image metadata only')
+        self.assertEqual(response.status_code,200,response.text)
+        updated=response.json()
+        self.assertEqual(updated['content'],'应保留的原目录说明')
+        self.assertEqual(updated['title'],'新图像标题')
+        self.assertEqual(updated['notes'],'仅改附件说明')
+        self.assertEqual(updated['extraction']['sections'],0)
 
     def test_private_material_not_returned_to_agent(self):
         record = self.material()

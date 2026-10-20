@@ -84,10 +84,41 @@ class DocxIndexTests(Fixture,unittest.TestCase):
         self.assertGreater(self.knowledge.sections('alpha','large-project','脚注中的补充资料')['total'],0)
 
     def test_metadata_can_be_edited_without_discarding_index(self):
-        self.ingest('<w:p><w:r><w:t>全文独有词</w:t></w:r></w:p>')
-        self.knowledge.save('alpha',{'id':'large-project','notes':'仅改元数据'})
+        original=self.ingest('<w:p><w:r><w:t>全文独有词</w:t></w:r></w:p>')
+        saved=self.knowledge.save('alpha',{'id':'large-project','title':'仅修订标题',
+            'notes':'仅改元数据','summary':'资料说明仍可修订','content':original['content']})
+        self.assertEqual(saved['title'],'仅修订标题')
+        self.assertEqual(saved['notes'],'仅改元数据')
+        self.assertEqual(saved['summary'],'资料说明仍可修订')
+        self.assertEqual(saved['extraction']['text_index'],original['extraction']['text_index'])
         self.assertEqual(self.knowledge.sections('alpha','large-project','全文独有词')['total'],1)
         self.assertEqual(self.client.get('/api/materials/alpha/large-project/sections?offset=-1').status_code,400)
+
+    def test_indexed_body_edit_is_rejected_without_changing_metadata_or_snippets(self):
+        self.ingest('<w:p><w:r><w:t>旧段落核验词：以原附件为准。</w:t></w:r></w:p>')
+        self.knowledge.save('alpha',{'id':'large-project','model_allowed':True})
+        folder=self.knowledge.folder('alpha')
+        metadata=folder/'large-project.json'
+        before_metadata=metadata.read_bytes()
+        before_record=self.knowledge.get('alpha','large-project')
+        index=folder/before_record['extraction']['text_index']
+        before_index=index.read_bytes()
+        before_history=set((folder/'history/large-project').glob('*.json'))
+        response=self.client.post('/api/materials/alpha',json={
+            'id':'large-project','title':'不应保存的新标题','summary':'不应保存的新摘要',
+            'notes':'不应保存的新备注','content':'新正文更正词：该段没有对应的新附件。'})
+        self.assertEqual(response.status_code,400,response.text)
+        self.assertIn('重新上传',response.json()['detail'])
+        self.assertIn('summary',response.json()['detail'])
+        self.assertIn('notes',response.json()['detail'])
+        self.assertEqual(metadata.read_bytes(),before_metadata)
+        self.assertEqual(index.read_bytes(),before_index)
+        self.assertEqual(set((folder/'history/large-project').glob('*.json')),before_history)
+        self.assertEqual(self.knowledge.get('alpha','large-project'),before_record)
+        old_hit=self.knowledge.search('alpha','旧段落核验词')
+        self.assertEqual(len(old_hit),1)
+        self.assertIn('旧段落核验词',old_hit[0]['snippets'][0]['text'])
+        self.assertEqual(self.knowledge.search('alpha','新正文更正词'),[])
 
     def test_second_attachment_preserves_previous_index_and_original(self):
         first=self.ingest('<w:p><w:r><w:t>旧正文</w:t></w:r></w:p>')

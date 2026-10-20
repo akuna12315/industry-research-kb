@@ -14,7 +14,7 @@ Windows PowerShell，在仓库根目录运行：
 powershell -ExecutionPolicy Bypass -File .\start-web.ps1
 ```
 
-脚本创建仓库内 `.venv`、安装固定版本依赖，并由 `scripts/init_workspace.py` 从模板生成本地配置；已有配置不覆盖。打开 [本地页面](http://127.0.0.1:8765/)。服务仅监听本机。
+脚本创建仓库内 `.venv`、安装固定版本依赖，并由 `scripts/init_workspace.py` 从模板生成本地配置；已有配置不覆盖。打开 [本地页面](http://127.0.0.1:8766/)。服务仅监听本机。
 
 也可手动启动（跨平台）：
 
@@ -28,12 +28,12 @@ python -m web.server
 
 ## 使用
 
-1. 在“行业与范围”创建行业，调整地区、分类与复核周期；新增行业的自动采集默认关闭。
-2. 在“信息来源”添加公开入口。preferred 优先指定来源并允许发现；only 限定启用入口及其允许目录。
-3. “网页搜索”默认用免密钥 DDGS/Bing，可切换 DuckDuckGo、Brave，或接入自有 SearXNG JSON API。搜索摘要只作线索。
-4. 选中搜索结果送入“批量采集”，或输入多个入口。支持 HTML / 文本 / RSS、同站链接、1至50页、深度0至3、限速、robots.txt、停止、URL和正文指纹去重、增量识别及失败记录。
-5. 在“Agent 设置”填写自己的 OpenAI 兼容接口或厂商 API 地址、协议、模型和密钥。启用单行业“研究并归档”，可以通过对话搜索、读取原文和分类归档；采集完成后也可点击“Agent整理归档”。
-6. 证据库支持中文检索、分类/状态/时效筛选、原始链接、核验日期与修订历史。“报告与记录”可生成和下载本地 Markdown 简报。
+1. 在右上角“设置 → 档案与范围”创建行业或林草地区，调整地区、分类与复核周期；新增行业的采集默认关闭。
+2. 在“设置 → 信息来源”添加公开入口。preferred 优先指定来源并允许发现；only 限定启用入口及其允许目录。
+3. 在“设置 → 模型与助手”填写兼容接口或厂商 API、协议、模型和密钥。默认对话只读，单行业“研究并归档”才开放网络调查和事实写入。
+4. “研究”是主界面，对话直接融入整页。右侧“研究工具”按需展开，包含找资料、采集与产出；桌面占右半屏，手机占满屏，收起保留输入和任务。
+5. “知识库”集中导入、搜索和查阅资料、知识证据；支持附件、分段原文、状态/时效筛选、来源链接及修订历史。
+6. 直接让助手“整理某问题的发展时间线并画图”，或“绘制某指标按年的变化趋势”。图表显示在回答中，不设独立时间线入口，节点可点击追溯引用。
 
 公开网页采集支持 HTML、文本和 RSS；本地专业资料另支持 PDF、DOCX 等附件。浏览器动态渲染、登录或付费资料不支持，不绕过访问控制。搜索/抓取失败会保留原因，不能作为“没有资料”的结论。
 
@@ -80,11 +80,12 @@ python scripts/kb.py --industry all search 合同
 python scripts/kb.py --industry all stale
 python scripts/kb.py --industry all status
 python scripts/kb.py update-plan
-python -m unittest web.test_web web.test_network web.test_knowledge web.test_regions web.test_docx_index -v
+python -m unittest web.test_web web.test_network web.test_knowledge web.test_regions web.test_docx_index web.test_charts -v
 python -m unittest discover -s scripts -p 'test_*.py' -v
+node web/test_frontend.cjs
 ```
 
-运行测试前需安装依赖并初始化配置。当前自动化检查共104项，测试资料在临时目录中，不写入真实行业档案。更多操作见 [页面说明](web/README.md)。
+运行测试前需安装依赖并初始化配置。当前自动化检查含135项后端/命令行测试和30项前端回归，测试资料在临时目录中，不写入真实行业档案。更多操作见 [页面说明](web/README.md)。
 
 ## 依赖
 

@@ -2,6 +2,7 @@
 from datetime import date, datetime
 import hashlib
 import io
+import json
 from pathlib import Path
 import re
 import zipfile
@@ -58,7 +59,7 @@ class Knowledge:
         with kb.lock(self.store.root):
             return self._save(industry, payload)
 
-    def _save(self, industry, payload, attachment=None, extraction=None):
+    def _save(self, industry, payload, attachment=None, extraction=None, validate_only=False):
         """Validate and commit while the caller holds the shared workspace lock."""
         self.store.entry(industry)
         key = ws.safe_id(payload.get('id') or 'doc-' + kb.uuid4().hex[:16])
@@ -86,6 +87,10 @@ class Knowledge:
         for field in ('region', 'issuer', 'number', 'version', 'summary', 'notes', 'project_stage', 'coverage_period', 'scale', 'coordinate_system', 'resolution', 'superseded_by'):
             record[field] = clean_text(record.get(field, ''), 3000)
         record['content'] = clean_text(record.get('content', ''))
+        if (attachment is None and extraction is None
+                and old.get('extraction', {}).get('text_index')
+                and record['content'] != old.get('content', '')):
+            raise ValueError('已建立原文分段索引，正文需重新上传附件更新；资料说明请使用摘要（summary）或备注（notes）。')
         if redact(record['summary'] + record['content']) != record['summary'] + record['content']:
             raise ValueError('资料不保存API密钥或访问令牌，请先移除密钥')
         for field in ('published_date', 'effective_date', 'checked_date', 'review_after'):
@@ -114,6 +119,8 @@ class Knowledge:
         if attachment is not None:
             record['attachment'] = attachment
             record['extraction'] = extraction
+        if validate_only:
+            return self.display(record)
         if old:
             kb.atomic_write(self.folder(industry) / 'history' / key / (kb.uuid4().hex + '.json'), kb.json_text(old))
         kb.atomic_write(path, kb.json_text(record))
@@ -231,13 +238,17 @@ class Knowledge:
                 matches.append({'index':n+1,'citation':f'{key}#block-{n+1}',**part})
         return {'total':len(matches),'offset':offset,'limit':limit,'items':matches[offset:offset+limit]}
 
-    def import_docx(self,industry,key,source):
+    def import_docx(self,industry,key,source,metadata=None):
         """Trusted local-file import; no arbitrary server-side path endpoint is exposed."""
         from .docx_index import extract_docx,write_index,MAX_FILE_BYTES
         source=Path(source)
         if source.suffix.lower()!='.docx' or not source.is_file() or source.stat().st_size>MAX_FILE_BYTES:
             raise ValueError('本地DOCX需为100MB以内文件')
-        self.get(industry,key)
+        if metadata is None:
+            self.get(industry,key)
+        else:
+            self.store.entry(industry)
+            ws.safe_id(key)
         with kb.lock(self.store.root):
             folder=self.folder(industry)
             files=folder/'files'
@@ -264,15 +275,16 @@ class Knowledge:
                 if any(redact(b['text'])!=b['text'] for b in blocks):
                     raise ValueError('正文含疑似访问令牌，请先移除凭据')
                 sha=digest.hexdigest()
-                relative=Path('text')/(sha+'-v1')/'index.json'
-                index=kb.read_json(folder/relative) if (folder/relative).exists() else write_index(folder/relative.parent,blocks,stats)
                 text='\n\n'.join(f"【{b['location']}】\n{b['text']}" for b in blocks)
                 if len(text)>200000:
                     text='正文与表格文字已完整建立分段索引，请使用原文检索查看片段。\n\n章节目录：\n'+\
                         '\n'.join(h['text']+'（'+h['location']+'）' for h in stats['headings'][:40])
+                record=self.get(industry,key) if metadata is None else metadata
+                self._save(industry,{**record,'content':text},attachment={},extraction={},validate_only=True)
+                relative=Path('text')/(sha+'-v1')/'index.json'
+                index=kb.read_json(folder/relative) if (folder/relative).exists() else write_index(folder/relative.parent,blocks,stats)
                 storage_name=key+'-'+sha+'.docx'
                 stage.replace(files/storage_name)
-                record=self.get(industry,key)
                 return self._save(industry,{**record,'content':text},
                     attachment={'name':source.name,'suffix':'.docx','sha256':sha,'storage_name':storage_name,'bytes':length},
                     extraction={**{k:v for k,v in stats.items() if k!='headings'},'sections':len(index['parts']),
@@ -281,8 +293,16 @@ class Knowledge:
             finally:
                 stage.unlink(missing_ok=True)
 
-    def upload(self, industry, key, filename, raw):
-        record = self.get(industry, key)
+    def import_material(self, industry, payload, filename, raw):
+        """Parse a file and commit its metadata together, after all validation succeeds."""
+        self.store.entry(industry)
+        key = ws.safe_id(payload.get('id') or 'doc-' + kb.uuid4().hex[:16])
+        return self.upload(industry, key, filename, raw, metadata={**payload, 'id': key})
+
+    def upload(self, industry, key, filename, raw, metadata=None):
+        record = self.get(industry, key) if metadata is None else metadata
+        if metadata is not None and (self.folder(industry) / (key + '.json')).exists():
+            record = {**self.get(industry, key), **metadata}
         suffix = Path(filename).suffix.lower()
         supported = ('.txt', '.md', '.csv', '.pdf', '.docx', '.png', '.jpg', '.jpeg', '.tif', '.tiff', '.geojson', '.zip')
         if len(raw) > 10_000_000 or suffix not in supported:
@@ -293,7 +313,7 @@ class Knowledge:
             with tempfile.TemporaryDirectory(dir=scratch) as temp:
                 source=Path(temp)/Path(filename).name
                 source.write_bytes(raw)
-                return self.import_docx(industry,key,source)
+                return self.import_docx(industry,key,source,metadata=metadata)
         sections = []
         if suffix in ('.txt', '.md', '.csv'):
             try:
@@ -323,10 +343,15 @@ class Knowledge:
         target = self.folder(industry) / 'files' / storage_name
         with kb.lock(self.store.root):
             # Re-read metadata after parsing so a concurrent edit is not overwritten.
-            current = self.get(industry, key)
+            if metadata is None:
+                current = self.get(industry, key)
+            else:
+                path = self.folder(industry) / (key + '.json')
+                current = {**(self.get(industry, key) if path.exists() else {}), **metadata}
             candidate = {**current, 'content': text if sections else current.get('content', '')}
             if redact(candidate['content']) != candidate['content']:
                 raise ValueError('资料不保存API密钥或访问令牌，请先移除密钥')
+            self._save(industry,candidate,attachment={},extraction={},validate_only=True)
             target.parent.mkdir(parents=True, exist_ok=True)
             temp = target.with_suffix(suffix + '.tmp')
             temp.write_bytes(raw)
@@ -397,7 +422,11 @@ class Knowledge:
         with kb.lock(self.store.root):
             record = kb.read_json(path) if path.exists() else {'id': key, 'conversation_id': conversation,
                 'industry': job['industry'], 'created_at': kb.now(), 'turns': []}
-            record['turns'] = [*record['turns'], {'prompt': redact(prompt), 'answer': redact(answer), 'at': kb.now()}][-50:]
+            turn = {'prompt': redact(prompt), 'answer': redact(answer), 'at': kb.now()}
+            charts = [event['chart'] for event in job.get('events', []) if event['type'] == 'chart']
+            if charts:
+                turn['charts'] = json.loads(redact(kb.json_text(charts)))
+            record['turns'] = [*record['turns'], turn][-50:]
             record['updated_at'] = kb.now()
             kb.atomic_write(path, kb.json_text(record))
 

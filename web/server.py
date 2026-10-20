@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -28,7 +28,7 @@ class BodyLimit:
     async def __call__(self, scope, receive, send):
         if scope['type'] != 'http' or scope['method'] not in ('POST', 'PUT', 'PATCH'):
             return await self.app(scope, receive, send)
-        limit = 12_000_000 if scope['path'].startswith('/api/materials/') and scope['path'].endswith('/upload') else 1_000_000
+        limit = 12_000_000 if scope['path'].startswith('/api/materials/') and scope['path'].endswith(('/upload', '/import')) else 1_000_000
         chunks, size = [], 0
         while True:
             message = await receive()
@@ -139,6 +139,27 @@ def create_app(root=None):
     @app.post('/api/materials/{industry}')
     def material_save(industry: str, payload: dict):
         return knowledge.save(industry, payload)
+
+    @app.post('/api/materials/{industry}/import')
+    async def material_import(industry: str, metadata: str = Form(...), file: UploadFile = File(...)):
+        try:
+            if len(metadata.encode('utf-8')) > 1_000_000:
+                raise ValueError('资料信息超过大小上限')
+            try:
+                payload = json.loads(metadata)
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError('资料信息需为JSON对象') from None
+            if not isinstance(payload, dict):
+                raise ValueError('资料信息需为JSON对象')
+            raw = await file.read(10_000_001)
+            try:
+                return await asyncio.to_thread(knowledge.import_material, industry, payload, file.filename or 'document.txt', raw)
+            except (ValueError, OSError):
+                raise
+            except Exception as exc:
+                raise ValueError('文档无法提取（' + type(exc).__name__ + '），请检查文件格式或使用文字版') from None
+        finally:
+            await file.close()
 
     @app.get('/api/materials/{industry}/{key}')
     def material_get(industry: str, key: str):
@@ -353,4 +374,4 @@ app = create_app()
 if __name__ == '__main__':
     import uvicorn
     kb.atomic_write(app.state.store.root / 'data/web-server.pid', str(os.getpid()) + '\n')
-    uvicorn.run(app, host='127.0.0.1', port=int(os.environ.get('KB_WEB_PORT', '8765')))
+    uvicorn.run(app, host='127.0.0.1', port=int(os.environ.get('KB_WEB_PORT', '8766')))

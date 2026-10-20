@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch, AsyncMock
 
 from fastapi.testclient import TestClient
-from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import FunctionModel
 
 from .server import create_app
@@ -157,9 +157,9 @@ class AgentTests(Fixture, unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    async def run_model(self, function, research=False):
+    async def run_model(self, function, research=False, industry='alpha'):
         runtime = AgentRuntime(self.store)
-        job = {'id': kb.uuid4().hex, 'conversation': kb.uuid4().hex, 'industry': 'alpha',
+        job = {'id': kb.uuid4().hex, 'conversation': kb.uuid4().hex, 'industry': industry,
                'research': research, 'status': 'running', 'events': [], 'started_at': kb.now()}
         await runtime.run(job, '查合同', model_override=FunctionModel(function))
         return job
@@ -174,6 +174,74 @@ class AgentTests(Fixture, unittest.IsolatedAsyncioTestCase):
         citations = next(e for e in job['events'] if e['type'] == 'citations')
         self.assertEqual(citations['items'][0]['id'], self.record['id'])
         self.assertTrue(any(e['type'] == 'answer' for e in job['events']))
+
+    async def test_empty_search_model_receives_scope_and_inventory_limits(self):
+        """Check real prompt/tool wiring, not a live model's compliance with the instructions."""
+        def model(messages, info):
+            if not any(isinstance(message, ModelResponse) for message in messages):
+                return ModelResponse(parts=[ToolCallPart('search_evidence',
+                    {'query': 'qa-unmatched-acceptance-id'}, tool_call_id='empty-search')])
+            returned = [part for message in messages for part in message.parts
+                        if isinstance(part, ToolReturnPart)]
+            self.assertEqual(returned[-1].content, [])
+            self.assertEqual(len(self.store.evidence('alpha')), 1)
+            instructions = info.instructions or ''
+            self.assertRegex(instructions, r'零命中[^\n]*当前授权范围[^\n]*查询')
+            self.assertRegex(instructions, r'不能据此断言[^\n]*整个档案[^\n]*全行业[^\n]*没有资料')
+            self.assertRegex(instructions, r'范围配置[^\n]*不是资产清单')
+            return ModelResponse(parts=[TextPart('本次授权检索未命中，不能据此判断整个档案为空。')])
+
+        job = await self.run_model(model)
+        self.assertEqual(job['status'], 'completed', job['events'])
+        citations = next(event for event in job['events'] if event['type'] == 'citations')
+        self.assertEqual(citations['items'], [])
+
+    async def test_inspect_industry_filters_other_industry_plans(self):
+        ws.industry_command(self.root, self.store.args(action='add', id='beta', name='其他行业',
+                                                     region='其他地区', categories=None))
+        ws.industry_command(self.root, self.store.args(action='enable', id='beta'))
+        beta = self.store.home('beta')
+        kb.atomic_write(beta / 'config/queries.json', kb.json_text(
+            {category: ['foreign-plan-only-marker'] for category in ws.scope(beta)['topics']}))
+
+        for enabled in (True, False):
+            with self.subTest(current_industry_enabled=enabled):
+                ws.industry_command(self.root, self.store.args(
+                    action='enable' if enabled else 'disable', id='alpha'))
+                full_plan = ws.update_plan(self.root)
+                own_plans = [item for item in full_plan['industries'] if item['industry_id'] == 'alpha']
+
+                def model(messages, info):
+                    if not any(isinstance(message, ModelResponse) for message in messages):
+                        return ModelResponse(parts=[ToolCallPart('inspect_industry', {}, tool_call_id='inspect-selected')])
+                    returned = [part for message in messages for part in message.parts
+                                if isinstance(part, ToolReturnPart)]
+                    content = returned[-1].content
+                    self.assertEqual(content['scope'], ws.scope(self.store.home('alpha')))
+                    self.assertEqual(content['sources'], self.store.sources('alpha'))
+                    self.assertEqual(content['update_plan']['industries'], own_plans)
+                    self.assertEqual({key: value for key, value in content['update_plan'].items() if key != 'industries'},
+                                     {key: value for key, value in full_plan.items() if key != 'industries'})
+                    self.assertNotIn('foreign-plan-only-marker', kb.json_text(content))
+                    return ModelResponse(parts=[TextPart('仅返回当前行业的计划。')])
+
+                job = await self.run_model(model)
+                self.assertEqual(job['status'], 'completed', job['events'])
+
+    async def test_inspect_all_preserves_cross_industry_state(self):
+        ws.industry_command(self.root, self.store.args(action='add', id='beta', name='其他行业',
+                                                     region='其他地区', categories=None))
+
+        def model(messages, info):
+            if not any(isinstance(message, ModelResponse) for message in messages):
+                return ModelResponse(parts=[ToolCallPart('inspect_industry', {}, tool_call_id='inspect-all')])
+            returned = [part for message in messages for part in message.parts
+                        if isinstance(part, ToolReturnPart)]
+            self.assertEqual({item['id'] for item in returned[-1].content['industries']}, {'alpha', 'beta'})
+            return ModelResponse(parts=[TextPart('跨档案范围保留完整目录。')])
+
+        job = await self.run_model(model, industry='all')
+        self.assertEqual(job['status'], 'completed', job['events'])
 
     async def test_unread_source_cannot_be_archived(self):
         calls = 0

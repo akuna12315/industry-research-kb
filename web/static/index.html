@@ -1,46 +1,33 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>研知 · 行业知识库</title>
-  <meta name="description" content="可追溯的行业研究、信息来源管理与智能调查助手">
-  <link rel="stylesheet" href="/static/style.css">
-  <script src="/static/app.js?v=20261017-docx" defer></script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#183e35">
+  <title>研知 · 知识研究工作台</title>
+  <meta name="description" content="在本机整理资料、检索证据、追溯来源，与研究助手一起开展调查。">
+  <link rel="stylesheet" href="/static/style.css?v=20261019-research-figures">
+  <script src="/static/research-charts.js?v=20261019-research-figures" defer></script>
+  <script src="/static/app.js?v=20261019-research-figures" defer></script>
 </head>
 <body>
+<a class="skip-link" href="#content">跳到主要内容</a>
 <div class="app-shell">
-  <aside class="sidebar">
-    <a class="brand" href="/" aria-label="研知首页"><span class="brand-icon">研</span><span>研知<small>INDUSTRY ATLAS</small></span></a>
-    <div class="workspace-label">我的研究空间 <span>LOCAL</span></div>
-    <nav aria-label="主要导航">
-      <button class="nav-item" data-view="forestry"><span class="nav-icon">♧</span>林草工作台</button>
-      <button class="nav-item" data-view="materials"><span class="nav-icon">▥</span>专业资料</button>
-      <button class="nav-item active" data-view="evidence"><span class="nav-icon">▤</span>证据库<span id="nav-count" class="count">0</span></button>
-      <button class="nav-item" data-view="industries"><span class="nav-icon">◫</span>行业与范围</button>
-      <button class="nav-item" data-view="sources"><span class="nav-icon">⌁</span>信息来源</button>
-      <button class="nav-item" data-view="websearch"><span class="nav-icon">⌕</span>网页搜索</button>
-      <button class="nav-item" data-view="crawls"><span class="nav-icon">↧</span>批量采集</button>
-      <button class="nav-item" data-view="review"><span class="nav-icon">◷</span>待复核<span id="review-count" class="count">0</span></button>
-      <button class="nav-item" data-view="reports"><span class="nav-icon">▧</span>报告与记录</button>
-      <button class="nav-item" data-view="memory"><span class="nav-icon">◇</span>记忆与对话</button>
-    </nav>
-    <div class="sidebar-note"><span class="note-mark">↗</span><strong>让研究有据可循</strong><p>每条事实保留来源、核验日期和修改历史。</p></div>
-    <div class="sidebar-bottom"><button class="nav-item" data-view="settings"><span class="nav-icon">⚙</span>Agent 设置</button><div class="local-status"><span class="dot"></span>本地知识库 <span id="server-date"></span></div></div>
-  </aside>
   <main class="main">
-    <header class="topbar"><div class="breadcrumb">研究空间 <span>/</span> <strong id="breadcrumb">证据库</strong></div><div class="topbar-right"><label for="industry-select">浏览范围</label><select id="industry-select"><option value="all">全部行业档案</option></select><button class="icon-button" id="refresh" title="刷新资料" aria-label="刷新资料">↻</button><button class="mobile-agent" id="show-agent">Agent</button></div></header>
-    <div class="content" id="content" aria-live="polite"></div>
-    <footer class="main-footer"><span>研知 / Industry Atlas</span><span>公开来源 · 可追溯证据 · 本地归档</span></footer>
+    <header class="topbar">
+      <div class="topbar-left"><a class="brand" href="/" aria-label="研知首页"><span class="brand-icon" aria-hidden="true">✳</span><span class="brand-copy">研知</span></a><nav class="workspace-navigation" aria-label="主要导航"><button class="nav-item active" data-workspace="research" data-view="research">研究</button><button class="nav-item" data-workspace="library" data-view="materials">知识库</button></nav></div>
+      <div class="topbar-right"><span class="workspace-status"><span class="dot"></span>本机</span><label for="industry-select">当前档案</label><select id="industry-select" aria-label="当前档案"><option value="all">全部行业档案</option></select><button class="icon-button" id="refresh" title="刷新资料" aria-label="刷新资料">↻</button><button class="icon-button" data-workspace="settings" data-view="settings" title="设置" aria-label="设置">⚙</button></div>
+    </header>
+    <div class="content" id="content" tabindex="-1" aria-live="polite"><div class="content-loading" role="status">正在连接本地知识库…</div></div>
+    <footer class="main-footer"><span class="local-status"><span class="dot"></span>资料保存在本机<span id="server-date"></span></span><span>研知 · RESEARCH STUDIO</span></footer>
   </main>
-  <aside class="agent-panel" id="agent-panel">
-    <div class="agent-header"><span class="agent-avatar">✳</span><div><strong>研究助手</strong><small>PydanticAI · 开源 Agent</small></div><button id="new-chat" class="icon-button" title="新对话" aria-label="新对话">＋</button></div>
-    <div class="agent-model"><span class="dot"></span><span id="model-name">连接模型</span><button id="agent-settings" aria-label="打开模型设置">↗</button></div>
-    <div class="chat-log" id="chat-log"><div class="agent-welcome"><div class="welcome-spark">✳</div><h2>从一个好问题开始</h2><p>我会先查知识库，再追到原始来源。你可以让我比较证据、检查旧资料，或整理一份简报。</p><button class="prompt-chip" data-prompt="概括现有证据，列出原始链接、核验日期和调查缺口。">概括现有证据 <span>↗</span></button><button class="prompt-chip" data-prompt="哪些资料需要重新核验？说明时效与事实状态的区别。">检查资料时效 <span>↗</span></button><button class="prompt-chip" data-prompt="为当前范围生成一份带来源、日期和限制的证据简报。">生成证据简报 <span>↗</span></button></div></div>
-    <form id="chat-form" class="chat-compose"><div class="chat-mode"><label><input id="research-mode" type="checkbox">研究并归档</label><span id="chat-scope">全部档案 · 只读</span></div><label class="source-permission"><input id="source-changes" type="checkbox">允许按我的要求添加信源</label><textarea id="chat-input" rows="3" placeholder="提出问题，或指定调查方向…" aria-label="发给研究助手的问题"></textarea><div class="compose-bottom"><span>Shift + Enter 换行</span><button id="stop-agent" type="button" class="stop-button" hidden>停止</button><button id="send-agent" type="submit" class="send-button" aria-label="发送问题">↑</button></div></form>
-    <div class="agent-footnote">依据来自工具结果；缺少证据时保留问题。</div>
-  </aside>
+  <div id="agent-parking" hidden><aside class="agent-panel" id="agent-panel" aria-label="研究助手">
+    <div class="agent-header"><div class="agent-model"><span class="dot"></span><span id="model-name">正在读取模型配置…</span><button id="agent-settings" aria-label="打开模型设置">↗</button></div><button class="secondary" id="research-tools-toggle" type="button" aria-controls="research-tools-drawer" aria-expanded="false">研究工具</button><button id="new-chat" class="icon-button" title="新对话" aria-label="新对话">＋</button></div>
+    <div class="chat-log" id="chat-log"><div class="agent-welcome"><div class="welcome-spark" aria-hidden="true">✳</div><h2>每次研究，<br>从一个好问题开始。</h2><p>检索已有资料，比较不同来源，或带着明确问题开展新的调查。</p><button class="prompt-chip" data-prompt="检索当前档案的专业资料和证据，列出原始来源、版本、核验日期与资料缺口。">帮我梳理已有资料 <span>↗</span></button><button class="prompt-chip" data-prompt="哪些资料需要重新核验？说明事实状态和时效，列出原始来源。">哪些依据需要复核 <span>↗</span></button><button class="prompt-chip" data-prompt="为当前范围生成一份带来源、日期、比较口径和限制的证据简报。">整理一份证据简报 <span>↗</span></button></div></div>
+    <form id="chat-form" class="chat-compose"><div class="chat-mode"><label><input id="research-mode" type="checkbox">研究并归档</label><label class="source-permission"><input id="source-changes" type="checkbox">允许按我的要求添加信源</label><span id="chat-scope">全部档案 · 只读</span></div><textarea id="chat-input" rows="3" placeholder="提问，或说说你想研究什么…" aria-label="发给研究助手的问题"></textarea><div class="compose-bottom"><span>Enter 发送 · Shift + Enter 换行</span><button id="stop-agent" type="button" class="stop-button" hidden>停止</button><button id="send-agent" type="submit" class="send-button" aria-label="发送问题" title="发送问题"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="m22 2-7 20-4-9-9-4Z"></path><path d="M22 2 11 13"></path></svg></button></div></form>
+  </aside></div>
 </div>
-<dialog id="dialog"><div class="dialog-header"><h2 id="dialog-title"></h2><button id="close-dialog" class="icon-button" aria-label="关闭">×</button></div><div id="dialog-body"></div></dialog>
+<dialog id="dialog" aria-labelledby="dialog-title"><div class="dialog-header"><h2 id="dialog-title"></h2><button id="close-dialog" class="icon-button" aria-label="关闭">×</button></div><div id="dialog-body"></div></dialog>
 <div id="toast" role="status" aria-live="polite"></div>
 </body>
 </html>
