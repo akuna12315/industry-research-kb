@@ -16,3 +16,7 @@
 - 验证：先python scripts/init_workspace.py，再python -m unittest web.test_web web.test_network web.test_knowledge web.test_regions web.test_docx_index，及python -m unittest discover -s scripts -p 'test_*.py'。
 
 - 专业资料、原附件、全文索引、偏好记忆及历史对话仅留本地；默认内部且不授权模型，restricted 不可授权。全国依据共享时保留原所属档案，地方资料不跨地区自动套用。
+
+- 资料核验由用户单份或批量确认；助手仅准备待确认资料。通过后本机固定切分全文并建立索引，不依赖模型或把分块当事实。保留原件、逐字定位、指纹和旧证据历史；图片未OCR须说明，旧模型全文提取任务不自动恢复。
+- 问答先本地召回，再对命中片段重排并分析；当前授权、地域隔离和版本检查不能被重排或缓存绕过。Qwen兼容模式保持轻量思考，用户当前模型配置优先，不自行切回历史接口。
+- 评测只发送题目，参考答案不发送模型；成功返回率、引用定位和数字诊断不能代替语义准确率。真实题库和回答仅留本地。

@@ -17,6 +17,9 @@ from .service import Store, kb, ws
 from .agent_runtime import AgentRuntime
 from .network import NetworkRuntime
 from .knowledge import Knowledge, KINDS, STATES
+from .verification import VerificationQueue
+from .full_extraction import FullExtractionRuntime
+from .material_index import MaterialIndex
 
 WEB = Path(__file__).resolve().parent
 
@@ -73,10 +76,18 @@ def create_app(root=None):
     network = NetworkRuntime(store)
     runtime = AgentRuntime(store, network)
     knowledge = Knowledge(store)
+    verifications = VerificationQueue(store)
+    extractions = FullExtractionRuntime(store, runtime)
+    material_index = MaterialIndex(store)
+    material_extraction_locks = {}
 
     @asynccontextmanager
     async def lifespan(app):
+        # The old model extraction manifests are history only. Build a local
+        # fixed-size index for approved material, without any model requests.
+        await material_index.restore()
         yield
+        await extractions.close()
         tasks = [*runtime.tasks.values(), *network.tasks.values()]
         for task in tasks:
             if not task.done():
@@ -89,6 +100,9 @@ def create_app(root=None):
     app.state.runtime = runtime
     app.state.network = network
     app.state.knowledge = knowledge
+    app.state.verifications = verifications
+    app.state.extractions = extractions
+    app.state.material_index = material_index
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=['127.0.0.1', 'localhost', '[::1]', 'testserver'])
     app.add_middleware(BodyLimit)
 
@@ -125,16 +139,106 @@ def create_app(root=None):
 
     @app.get('/')
     def index():
-        return FileResponse(WEB / 'static/index.html')
+        return FileResponse(WEB / 'static/index.html', headers={'Cache-Control': 'no-store'})
 
     @app.get('/api/state')
     def state():
         return {**store.state(), 'agent': runtime.public_config(), 'network': network.config(),
                 'knowledge': knowledge.settings(), 'material_kinds': KINDS, 'material_states': STATES}
 
+    @app.get('/api/verifications')
+    def verification_list(industry: str = 'all', status: str = 'pending'):
+        return verifications.list(industry, status)
+
+    @app.post('/api/verifications/materials')
+    async def verification_prepare(payload: dict):
+        items = payload.get('items')
+        mode = payload.get('mode', 'manual')
+        if not isinstance(items, list) or not 1 <= len(items) <= 10:
+            raise ValueError('每批请选择1至10份资料')
+        if mode not in ('manual', 'automatic'):
+            raise ValueError('核验方式需为manual或automatic')
+        result = {'items': [], 'errors': []}
+        for item in items:
+            industry = item.get('industry_id') if isinstance(item, dict) else None
+            material_id = item.get('material_id') if isinstance(item, dict) else None
+            try:
+                if not isinstance(industry, str) or not isinstance(material_id, str):
+                    raise ValueError('请指定资料所属行业和资料ID')
+                analysis = None
+                if mode == 'automatic':
+                    context = verifications.material_context(industry, material_id)
+                    material = context['material']
+                    if not material.get('model_allowed') or material.get('sensitivity') == 'restricted':
+                        raise ValueError('资料尚未授权模型引用，不能自动分析')
+                    analysis = await runtime.review_material(context)
+                result['items'].append(verifications.prepare_material(industry, material_id, mode, analysis))
+            except (ValueError, OSError) as exc:
+                result['errors'].append({'industry_id': industry, 'material_id': material_id, 'error': str(exc)})
+            except Exception as exc:
+                result['errors'].append({'industry_id': industry, 'material_id': material_id,
+                    'error': '核验分析未完成（' + type(exc).__name__ + '），资料未归档为证据'})
+        return result
+
+    @app.get('/api/verifications/{industry}/{key}')
+    def verification_get(industry: str, key: str):
+        return verifications.get(industry, key)
+
+    @app.post('/api/verifications/{industry}/{key}/decision')
+    async def verification_decide(industry: str, key: str, payload: dict):
+        # Explicit candidate edits retain the original API for existing clients.
+        if payload.get('decision') != 'approve' or 'candidates' in payload:
+            return await extractions._transaction(verifications.decide, industry, key, payload)
+        review = verifications.get(industry, key)
+        if review['source']['kind'] != 'material':
+            result = await extractions._transaction(verifications.decide, industry, key, payload, {'extraction_method': 'model'})
+            if result.get('material_id'):
+                indexed = await asyncio.to_thread(material_index.build, industry, result['material_id'])
+                return {**result, 'extraction_status': 'indexed', 'extraction_job': indexed}
+            return result
+        lock = material_extraction_locks.setdefault((industry, key), asyncio.Lock())
+        if lock.locked():
+            return verifications.get(industry, key)
+        async with lock:
+            result = await extractions._transaction(verifications.approve_material, industry, key, payload)
+            job = await asyncio.to_thread(material_index.build, industry, result['material_id'])
+            return {**result, 'extraction_status': 'indexed',
+                    'extraction_job': job}
+
+    @app.get('/api/extractions')
+    def extraction_list(industry: str = 'all'):
+        return extractions.list(industry)
+
+    @app.get('/api/extractions/{industry}/{key}')
+    def extraction_get(industry: str, key: str):
+        if key.startswith('index-'):
+            result = material_index.latest(industry, key[6:])
+            if not result:
+                raise ValueError('全文索引不存在')
+            return result
+        return extractions.get(industry, key)
+
+    @app.post('/api/materials/{industry}/{key}/extractions')
+    async def extraction_create(industry: str, key: str, payload: dict):
+        if type(payload.get('restart', False)) is not bool:
+            raise ValueError('重新提取参数应为布尔值')
+        return await asyncio.to_thread(material_index.build, industry, key, force=payload.get('restart', False))
+
+    @app.post('/api/materials/{industry}/{key}/index')
+    async def material_reindex(industry: str, key: str):
+        return await asyncio.to_thread(material_index.build, industry, key, force=True)
+
+    @app.post('/api/extractions/{industry}/{key}/control')
+    async def extraction_control(industry: str, key: str, payload: dict):
+        if payload.get('action') in ('resume', 'retry'):
+            old = extractions.get(industry, key)
+            return await asyncio.to_thread(material_index.build, industry, old['material_id'])
+        return await extractions.control(industry, key, payload.get('action'))
+
     @app.get('/api/materials')
     def materials(industry: str = 'all', q: str = '', kind: str = ''):
-        return [{k: v for k, v in r.items() if k != 'content'} for r in knowledge.list(industry, q, kind)]
+        return [{k: v for k, v in r.items() if k != 'content'} | {
+            'extraction_job': material_index.latest(r['industry_id'], r['id'])} for r in knowledge.list(industry, q, kind)]
 
     @app.post('/api/materials/{industry}')
     def material_save(industry: str, payload: dict):
@@ -163,7 +267,7 @@ def create_app(root=None):
 
     @app.get('/api/materials/{industry}/{key}')
     def material_get(industry: str, key: str):
-        return knowledge.display(knowledge.get(industry, key))
+        return {**knowledge.display(knowledge.get(industry, key)), 'extraction_job': material_index.latest(industry, key)}
 
     @app.post('/api/materials/{industry}/{key}/upload')
     async def material_upload(industry: str, key: str, file: UploadFile = File(...)):
@@ -314,11 +418,12 @@ def create_app(root=None):
         return ws.update_plan(store.root)
 
     @app.put('/api/agent/config')
-    def agent_config(payload: dict):
+    async def agent_config(payload: dict):
         secret = payload.pop('api_key', None)
         if secret is not None and not isinstance(secret, str):
             raise ValueError('密钥格式错误')
-        return runtime.save_config(payload, secret)
+        result = runtime.save_config(payload, secret)
+        return result
 
     @app.post('/api/agent/test')
     async def agent_test():

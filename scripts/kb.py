@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 import sqlite3
 import sys
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
@@ -58,18 +58,112 @@ def lock(root):
         path.unlink(missing_ok=True)
 
 
+def material_fingerprint(record):
+    """Bind a review to source content and version, independently of permissions."""
+    source = {k: record.get(k) for k in ('title', 'kind', 'region', 'issuer', 'number',
+        'version', 'url', 'published_date', 'effective_date', 'summary', 'content',
+        'project_stage', 'coverage_period', 'scale', 'coordinate_system', 'resolution', 'notes')}
+    source['attachment_sha256'] = record.get('attachment', {}).get('sha256')
+    source['text_index'] = record.get('extraction', {}).get('text_index')
+    return hashlib.sha256(json.dumps(source, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+
+def material_source_current(material, source):
+    if not isinstance(source, dict):
+        return False
+    if source.get('source_fingerprint'):
+        verification = material.get('verification') or {}
+        return (verification.get('status') == 'reviewed'
+                and verification.get('public_source_fingerprint') == source['source_fingerprint']
+                and verification.get('fingerprint') == material_fingerprint(material))
+    return source.get('fingerprint') == material_fingerprint(material)
+
+
+def material_quote_matches(root, material, source):
+    """Resolve a bounded citation against the stored source, without trusting paths."""
+    citation, quote = source['citation'], source['quote']
+    key = re.escape(material['id'])
+    match = re.fullmatch(key + r'#block-(\d+)-chars-(\d+)-(\d+)', citation)
+    if match:
+        block, start, end = map(int, match.groups())
+        base = (root / 'materials' / 'text').resolve()
+        relative = material.get('extraction', {}).get('text_index', '')
+        if not relative:
+            return False
+        index_path = (root / 'materials' / relative).resolve()
+        if not index_path.is_relative_to(base) or index_path.name != 'index.json':
+            return False
+        index = read_json(index_path)
+        if not 1 <= block <= len(index['parts']):
+            return False
+        filename = index['parts'][block - 1]['file']
+        if not re.fullmatch(r'\d{5}\.json', filename):
+            return False
+        body = read_json(index_path.parent / filename)['text']
+    else:
+        match = re.fullmatch(key + r'#chars-(\d+)-(\d+)', citation)
+        if not match:
+            return False
+        start, end = map(int, match.groups())
+        body = material.get('content') or material.get('summary', '')
+    return 1 <= start <= end <= len(body) and quote in body[start - 1:end]
+
+
 def validate(record):
     if not isinstance(record, dict):
         raise ValueError('每条证据必须是 JSON 对象')
     record = dict(record)
-    for key in ('title', 'summary', 'url', 'publisher', 'region', 'category', 'status', 'checked_date'):
+    reference = record.get('related_material')
+    if reference is not None:
+        if not isinstance(reference, dict):
+            raise ValueError('关联原始资料需为对象')
+        for field in ('industry_id', 'material_id'):
+            if not isinstance(reference.get(field), str) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{2,79}', reference[field]):
+                raise ValueError('关联原始资料标识无效')
+        for field in ('fingerprint', 'source_fingerprint'):
+            if field in reference and (not isinstance(reference[field], str) or not re.fullmatch(r'[a-f0-9]{64}', reference[field])):
+                raise ValueError('关联原始资料指纹无效')
+        if not reference.get('fingerprint'):
+            raise ValueError('关联原始资料需保留版本指纹')
+        for field, maximum in (('citation', 300), ('quote', 1200)):
+            if not isinstance(reference.get(field), str) or not reference[field].strip() or len(reference[field]) > maximum:
+                raise ValueError('关联原始资料需保留位置和短摘录')
+    for key in ('title', 'summary', 'publisher', 'region', 'category', 'status', 'checked_date'):
         if not isinstance(record.get(key), str) or not record[key].strip():
             raise ValueError(f'缺少必填字段: {key}')
         record[key] = record[key].strip()
-    url = urlsplit(record['url'])
-    if url.scheme not in ('https', 'http') or not url.hostname or url.username or url.password:
-        raise ValueError('url 必须是无凭据的公开 http/https 来源链接')
-    record['url'] = urlunsplit((url.scheme.lower(), url.netloc.lower(), url.path, url.query, ''))
+    if record.get('source_kind', 'public_web') not in ('public_web', 'local_material'):
+        raise ValueError('不支持的证据来源类型')
+    if record.get('source_kind') == 'local_material':
+        if record.get('url') not in ('', None):
+            raise ValueError('本地资料证据使用资料定位，不填写公开来源URL')
+        record['url'] = ''
+        source = record.get('material_source')
+        if not isinstance(source, dict):
+            raise ValueError('本地证据缺少原始资料定位')
+        for field in ('industry_id', 'material_id'):
+            if not isinstance(source.get(field), str) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{2,79}', source[field]):
+                raise ValueError('原始资料标识无效')
+        if not isinstance(source.get('fingerprint'), str) or not re.fullmatch(r'[a-f0-9]{64}', source['fingerprint']):
+            raise ValueError('本地证据缺少有效的资料版本指纹')
+        for field, maximum in (('citation', 300), ('quote', 1200)):
+            if not isinstance(source.get(field), str) or not source[field].strip() or len(source[field]) > maximum:
+                raise ValueError('本地证据需保留原文位置与短摘录')
+        if source.get('attachment_sha256') is not None and not re.fullmatch(r'[a-f0-9]{64}', str(source['attachment_sha256'])):
+            raise ValueError('原附件指纹无效')
+        if record.get('sensitivity') not in ('public', 'internal', 'restricted') or type(record.get('model_allowed')) is not bool:
+            raise ValueError('本地证据需保留资料级别和模型引用授权')
+        if record['sensitivity'] == 'restricted' and record['model_allowed']:
+            raise ValueError('受限资料不能授权模型引用')
+    else:
+        if not isinstance(record.get('url'), str) or not record['url'].strip():
+            raise ValueError('缺少必填字段: url')
+        url = urlsplit(record['url'].strip())
+        if url.scheme not in ('https', 'http') or not url.hostname or url.username or url.password:
+            raise ValueError('url 必须是无凭据的公开 http/https 来源链接')
+        record['url'] = urlunsplit((url.scheme.lower(), url.netloc.lower(), url.path, url.query, ''))
+        if record.get('material_source'):
+            raise ValueError('资料来源引用需使用 local_material 类型')
     if record['status'] not in STATUSES:
         raise ValueError('不支持的 status')
     for key in ('published_date', 'event_date', 'checked_date'):
@@ -109,7 +203,8 @@ def validate(record):
                 raise ValueError('数字必须包含名称、单位、期间、地区、统计对象、依据与实际/规划性质')
             if isinstance(metric.get('value'), bool) or not isinstance(metric.get('value'), (int, float)):
                 raise ValueError('metric.value 必须是数字')
-    record.setdefault('id', hashlib.sha256((record['url'] + '\n' + record['title']).encode()).hexdigest()[:16])
+    identity = record['url'] or json.dumps(record.get('material_source'), sort_keys=True, ensure_ascii=False)
+    record.setdefault('id', hashlib.sha256((identity + '\n' + record['title']).encode()).hexdigest()[:16])
     if not isinstance(record['id'], str) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{2,79}', record['id']):
         raise ValueError('id 必须是安全的小写字母、数字、下划线或连字符')
     # System-controlled timestamps cannot be supplied by an importer.
@@ -123,7 +218,8 @@ def render(record):
              f"- 证据编号：{record['id']}",
              f"- 状态：{LABELS[record['status']]}",
              f"- 发布机构：{record['publisher']}",
-             f"- 来源：[{record['publisher']}]({record['url']})",
+             (f"- 来源：本地资料 {record['material_source']['material_id']} / {record['material_source']['citation']}"
+              if record.get('source_kind') == 'local_material' else f"- 来源：[{record['publisher']}]({record['url']})"),
              f"- 发布日期：{record['published_date'] or '未明确'}",
              f"- 事件日期：{record['event_date'] or '未明确/不适用'}",
              f"- 最后核验：{record['checked_date']}",
@@ -131,6 +227,10 @@ def render(record):
              f"- 标签：{'、'.join(record['tags'])}", '', record['summary'], '']
     if record.get('limitations'):
         lines.extend(['## 适用范围与限制', '', record['limitations'], ''])
+    if record.get('source_kind') == 'local_material':
+        source = record['material_source']
+        lines.extend(['## 原始资料定位', '', f"- 所属档案：{source['industry_id']}",
+            f"- 资料版本指纹：{source['fingerprint']}", f"- 资料级别：{record['sensitivity']}", '', source['quote'], ''])
     for key, label in (('source_id', '来源编号'), ('review_after', '复核日期'),
                        ('valid_until', '已知有效截止'), ('superseded_by', '替代证据')):
         if record.get(key):
@@ -163,7 +263,7 @@ def reindex(root):
     return len(rows)
 
 
-def import_records(root, payload):
+def import_records(root, payload, *, already_locked=False):
     if isinstance(payload, dict):
         payload = [payload]
     if not isinstance(payload, list) or not payload:
@@ -172,7 +272,23 @@ def import_records(root, payload):
     if len({r['id'] for r in records}) != len(records):
         raise ValueError('同一批导入不能重复使用证据 id')
     counts = {'inserted': 0, 'updated': 0, 'unchanged': 0}
-    with lock(root):
+    with nullcontext() if already_locked else lock(root):
+        for record in records:
+            if record.get('source_kind') == 'local_material':
+                source = record['material_source']
+                material_path = root / 'materials' / (source['material_id'] + '.json')
+                if not material_path.is_file():
+                    raise ValueError('本地证据对应的原始资料不存在')
+                material = read_json(material_path)
+                if material.get('industry_id') != source['industry_id'] or material_fingerprint(material) != source['fingerprint']:
+                    raise ValueError('资料版本或所属档案已变化，请重新核验')
+                if source.get('attachment_sha256') != material.get('attachment', {}).get('sha256'):
+                    raise ValueError('原附件指纹与核验版本不一致')
+                if not material_quote_matches(root, material, source):
+                    raise ValueError('本地证据摘录与原始资料位置不匹配，请重新核验')
+                # The importer cannot broaden a document's privacy permissions.
+                record['sensitivity'] = material.get('sensitivity', 'internal')
+                record['model_allowed'] = bool(material.get('model_allowed')) and record['sensitivity'] != 'restricted'
         for record in records:
             path = root / 'evidence' / (record['id'] + '.json')
             old = read_json(path) if path.exists() else None

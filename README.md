@@ -55,6 +55,10 @@ python scripts/import_material.py ./document.docx --industry forestry-example --
 
 全文按段落和表格单元格建立索引，详情可检索分段原文并下载原件。扫描件和图片不做 OCR，不提供 GIS 计算或外部专业数据库接入。资料默认内部、待核验且不发送模型；模型引用必须逐项授权。级别标记不构成多人访问权限。
 
+资料支持单份和批量通过核验，模型辅助检查后仍由用户作决定。通过后在本机按1200字符硬切分、相邻重叠180字符建立全文检索索引，不调用模型或逐批提炼事实。已通过资料提供“重建全文索引”；原件、逐字定位、版本指纹、旧证据与历史保留，旧模型提取任务不再自动续跑。图片尚未OCR，索引完成不表示外部事实已核实。
+
+普通资料问答先在本地召回，再由模型选择命中片段并据完整片段回答；重排失败会说明使用本地相关性排序。授权、地域隔离和版本检查在检索与引用时执行。支持本机Qwen兼容接口，保持轻量思考；公开版仍从空白模型配置启动，不附带个人接口配置。
+
 全国基础档案可设置 `specialty=forestry` 和 `library_role=national-foundation`，地区检索会引用其中的共同依据并标明所属档案。地方资料保持独立；公开版不附带实际全国或地方资料。偏好记忆需手动保存及授权，对话历史默认关闭。
 
 ## 隐私和事实边界
@@ -80,12 +84,27 @@ python scripts/kb.py --industry all search 合同
 python scripts/kb.py --industry all stale
 python scripts/kb.py --industry all status
 python scripts/kb.py update-plan
-python -m unittest web.test_web web.test_network web.test_knowledge web.test_regions web.test_docx_index web.test_charts -v
+python -m unittest discover -s web -t . -p 'test_*.py' -v
 python -m unittest discover -s scripts -p 'test_*.py' -v
 node web/test_frontend.cjs
 ```
 
-运行测试前需安装依赖并初始化配置。当前自动化检查含135项后端/命令行测试和30项前端回归，测试资料在临时目录中，不写入真实行业档案。更多操作见 [页面说明](web/README.md)。
+运行测试前需安装依赖并初始化配置。测试资料在临时目录中，不写入真实行业档案。更多操作见 [页面说明](web/README.md)。
+Windows 下建议使用较短的工作区路径，避免历史记录文件名触发系统路径长度限制。
+
+## 本机助手评测
+
+`scripts/evaluate_assistant.py` 可顺序运行自备的100题，并持续输出CSV明细、JSON检查点和原始回答。每题独立只读会话，参考答案不发送给助手；支持停止及断点续跑。公开仓库不包含真实题库或回答。本脚本当前仅接受本机Qwen接口，防止误用外部收费模型；不修改平台模型设置。
+
+题库在本地 `work/evaluation/questions.py` 定义 `QA = [dict(...), ...]`，每项包含 `no`（1—100）、`module`、`q`、`a`、`src`、`quote`、`note`。读取器只解析字面量数据，不执行该文件。示例字段：`dict(no=1, module='示例', q='示例问题', a='参考答案', src='章节', quote='原文摘录', note='说明')`。参考答案也需要核对。
+
+```sh
+python scripts/evaluate_assistant.py --industry example --material example-material
+python scripts/evaluate_assistant.py --status
+python scripts/evaluate_assistant.py --stop
+```
+
+服务和本机模型需先启动；重复启动会被锁阻止。系统失败与回答错误分别记录，数字出现及定位有效仅为辅助诊断，不能当作准确率。JSON与CSV保存前强制落盘，仍需自行保障机器和存储的稳定运行。
 
 ## 依赖
 

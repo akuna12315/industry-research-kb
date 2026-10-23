@@ -10,6 +10,8 @@ from .test_web import Fixture
 from .network import NetworkRuntime, Robots, canonical_url
 from .agent_runtime import fetch_page, public_url, build_agent, ResearchContext, AgentRuntime
 from .service import kb
+from .verification import VerificationQueue
+from .knowledge import Knowledge
 
 
 class NetworkTests(Fixture, unittest.IsolatedAsyncioTestCase):
@@ -72,14 +74,29 @@ class NetworkTests(Fixture, unittest.IsolatedAsyncioTestCase):
             calls += 1
             ids = ['budget-one', self.record['id'], 'budget-two']
             part = ToolCallPart('archive_evidence', {'record': {**self.record, 'id': ids[calls - 1],
-                'summary': '本轮修订资料'}}, tool_call_id=str(calls)) if calls <= 3 else TextPart('遵守新增上限。')
+                'summary': '本轮修订资料', 'quote': '本轮修订资料'}}, tool_call_id=str(calls)) if calls <= 3 else TextPart('遵守新增上限，待用户核验确认。')
             return ModelResponse(parts=[part])
-        ctx = ResearchContext(self.store, 'alpha', True, pages={self.record['url']: self.page(self.record['url'])})
+        ctx = ResearchContext(self.store, 'alpha', True,
+            pages={self.record['url']: self.page(self.record['url'], text='本轮修订资料：企业披露合同，仍需核对履约进度。')})
         await build_agent(FunctionModel(model)).run('归档', deps=ctx)
         self.assertEqual(ctx.new_ids, {'budget-one'})
-        self.assertEqual(len(ctx.imported_ids), 2)
+        self.assertEqual(ctx.imported_ids, [])
+        self.assertEqual(len(ctx.pending_review_ids), 2)
+        self.assertFalse((self.store.home('alpha') / 'evidence/budget-one.json').exists())
         self.assertFalse((self.store.home('alpha') / 'evidence/budget-two.json').exists())
+        self.assertEqual(kb.read_json(self.store.home('alpha') / 'evidence' / (self.record['id'] + '.json'))['summary'], self.record['summary'])
+        queue = VerificationQueue(self.store)
+        for review_id in ctx.pending_review_ids:
+            pending = queue.get('alpha', review_id)
+            self.assertEqual(pending['status'], 'pending')
+            approved = queue.decide('alpha', review_id, {'decision': 'approve', 'note': '已手动核对原文'})
+            self.assertEqual(approved['evidence_ids'], [pending['web_record']['id']])
+            material = Knowledge(self.store).get('alpha', approved['material_id'])
+            self.assertIn(pending['web_record']['id'], material['related_evidence_ids'])
+        self.assertTrue((self.store.home('alpha') / 'evidence/budget-one.json').exists())
         self.assertEqual(kb.read_json(self.store.home('alpha') / 'evidence' / (self.record['id'] + '.json'))['summary'], '本轮修订资料')
+        self.assertTrue(list((self.store.home('alpha') / 'history' / self.record['id']).glob('*.json')))
+        self.assertFalse((self.store.home('alpha') / 'evidence/budget-two.json').exists())
 
     async def test_agent_single_reader_obeys_robots_disallow(self):
         client = httpx.AsyncClient
@@ -267,20 +284,31 @@ class NetworkTests(Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page['links'][0]['url'], 'https://example.org/news/a')
         self.assertIn('新公告', page['text'])
 
-    async def test_agent_search_then_read_then_real_archive(self):
+    async def test_agent_search_then_read_waits_for_confirmation_before_real_archive(self):
         calls = 0
         def model(messages, info):
             nonlocal calls
             calls += 1
             parts = [ToolCallPart('search_web', {'query': '合同'}, tool_call_id='search'),
                      ToolCallPart('read_public_source', {'url': self.record['url']}, tool_call_id='read'),
-                     ToolCallPart('archive_evidence', {'record': {**self.record, 'id': 'network-archived'}}, tool_call_id='archive')]
-            return ModelResponse(parts=[parts[calls - 1] if calls <= 3 else TextPart('已读原文归档。')])
+                     ToolCallPart('archive_evidence', {'record': {**self.record, 'id': 'network-archived',
+                        'quote': '企业披露合同'}}, tool_call_id='archive')]
+            return ModelResponse(parts=[parts[calls - 1] if calls <= 3 else TextPart('已读原文，是否通过核验并入库？')])
         deps = ResearchContext(self.store, 'alpha', True, network=self.network)
-        with patch.object(self.network, 'search', new=AsyncMock(return_value={'items': [{'url': self.record['url']}]})), patch('web.agent_runtime.fetch_page', new=AsyncMock(return_value=self.page(self.record['url']))):
+        with patch.object(self.network, 'search', new=AsyncMock(return_value={'items': [{'url': self.record['url']}]})), patch('web.agent_runtime.fetch_page', new=AsyncMock(return_value=self.page(self.record['url'], text='企业披露合同，仍需核对履约进度。'))):
             result = await build_agent(FunctionModel(model)).run('搜索并归档', deps=deps)
-        self.assertIn('归档', result.output)
+        self.assertIn('是否通过核验', result.output)
+        self.assertFalse((self.store.home('alpha') / 'evidence/network-archived.json').exists())
+        self.assertEqual(deps.imported_ids, [])
+        queue = VerificationQueue(self.store)
+        pending = queue.get('alpha', deps.pending_review_ids[0])
+        self.assertEqual(pending['status'], 'pending')
+        approved = queue.decide('alpha', pending['id'], {'decision': 'approve'})
+        self.assertEqual(approved['evidence_ids'], ['network-archived'])
         self.assertTrue((self.store.home('alpha') / 'evidence/network-archived.json').exists())
+        evidence = kb.read_json(self.store.home('alpha') / 'evidence/network-archived.json')
+        self.assertEqual(evidence['related_material']['material_id'], approved['material_id'])
+        self.assertIn(evidence['id'], Knowledge(self.store).get('alpha', approved['material_id'])['related_evidence_ids'])
 
     async def test_readonly_agent_cannot_search_or_add_sources(self):
         calls = 0
@@ -297,11 +325,21 @@ class NetworkTests(Fixture, unittest.IsolatedAsyncioTestCase):
         def model(messages, info):
             nonlocal calls
             calls += 1
-            part = ToolCallPart('crawl_public_sources', {'urls': [self.record['url']], 'max_pages': 1, 'max_depth': 0}, tool_call_id='crawl') if calls == 1 else ToolCallPart('archive_evidence', {'record': {**self.record, 'id': 'batch-archived'}}, tool_call_id='archive') if calls == 2 else TextPart('采集后归档。')
+            part = ToolCallPart('crawl_public_sources', {'urls': [self.record['url']], 'max_pages': 1, 'max_depth': 0}, tool_call_id='crawl') if calls == 1 else ToolCallPart('archive_evidence', {'record': {**self.record, 'id': 'batch-archived', 'quote': '企业披露合同'}}, tool_call_id='archive') if calls == 2 else TextPart('采集后等待用户核验确认。')
             return ModelResponse(parts=[part])
-        with patch('web.agent_runtime.fetch_page', new=AsyncMock(return_value=self.page(self.record['url']))):
-            await build_agent(FunctionModel(model)).run('批量采集', deps=ResearchContext(self.store, 'alpha', True, network=self.network))
+        deps = ResearchContext(self.store, 'alpha', True, network=self.network)
+        with patch('web.agent_runtime.fetch_page', new=AsyncMock(return_value=self.page(self.record['url'], text='企业披露合同，仍需核对履约进度。'))):
+            await build_agent(FunctionModel(model)).run('批量采集', deps=deps)
+        self.assertFalse((self.store.home('alpha') / 'evidence/batch-archived.json').exists())
+        self.assertEqual(deps.imported_ids, [])
+        self.assertEqual(len(deps.pending_review_ids), 1)
+        queue = VerificationQueue(self.store)
+        pending = queue.get('alpha', deps.pending_review_ids[0])
+        self.assertEqual(pending['status'], 'pending')
+        approved = queue.decide('alpha', pending['id'], {'decision': 'approve'})
+        self.assertEqual(approved['evidence_ids'], ['batch-archived'])
         self.assertTrue((self.store.home('alpha') / 'evidence/batch-archived.json').exists())
+        self.assertIn('batch-archived', Knowledge(self.store).get('alpha', approved['material_id'])['related_evidence_ids'])
 
     async def test_fake_ip_resolution_pins_real_public_target(self):
         import socket

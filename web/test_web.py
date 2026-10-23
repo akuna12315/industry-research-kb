@@ -22,7 +22,10 @@ class Fixture:
         self.root = Path(self.temp.name)
         kb.atomic_write(self.root / 'config/industries.json', kb.json_text({'version': 1, 'active_industry': None, 'industries': []}))
         kb.atomic_write(self.root / 'config/automation.json', kb.json_text({'schedule': '每天09:00', 'status': 'ACTIVE'}))
-        kb.atomic_write(self.root / 'config/agent.json', kb.json_text(kb.read_json(kb.DEFAULT_ROOT / 'config/agent.json')))
+        test_config = {**kb.read_json(kb.DEFAULT_ROOT / 'config/agent.json'),
+            'provider_id': 'synthetic-test', 'display_name': '合成测试模型',
+            'base_url': 'https://model.example/v1', 'protocol': 'chat_completions', 'model': 'synthetic-model'}
+        kb.atomic_write(self.root / 'config/agent.json', kb.json_text(test_config))
         ws.industry_command(self.root, Store(self.root).args(action='add', id='alpha', name='测试行业', region='中国', categories=None))
         self.store = Store(self.root)
         self.record = {'id': 'test-contract', 'title': '测试合同', 'summary': '企业披露合同，待核对履约进度。',
@@ -340,7 +343,7 @@ class AgentTests(Fixture, unittest.IsolatedAsyncioTestCase):
         job = await self.run_model(model)
         self.assertEqual(job['status'], 'completed', job['events'])
 
-    async def test_research_reads_original_before_real_import(self):
+    async def test_research_reads_original_then_requests_user_verification(self):
         calls = 0
         def model(messages, info):
             nonlocal calls
@@ -348,16 +351,30 @@ class AgentTests(Fixture, unittest.IsolatedAsyncioTestCase):
             if calls == 1:
                 return ModelResponse(parts=[ToolCallPart('read_public_source', {'url': self.record['url']}, tool_call_id='read-original')])
             if calls == 2:
-                return ModelResponse(parts=[ToolCallPart('archive_evidence', {'record': {**self.record, 'id': 'read-then-archived'}}, tool_call_id='archive-after-read')])
-            return ModelResponse(parts=[TextPart('原文已读，证据已归档。')])
+                return ModelResponse(parts=[ToolCallPart('archive_evidence', {'record': {**self.record,
+                    'id': 'read-then-reviewed', 'quote': '企业披露合同'}}, tool_call_id='archive-after-read')])
+            returned = [part for message in messages for part in message.parts if isinstance(part, ToolReturnPart)]
+            self.assertEqual(returned[-1].content['status'], 'pending')
+            self.assertIn('不得声称已归档', returned[-1].content['message'])
+            return ModelResponse(parts=[TextPart('原文已读，等待您确认：是否通过核验并入库？')])
         page = {'url': self.record['url'], 'requested_url': self.record['url'], 'title': '测试合同原文',
                 'text': '企业披露合同', 'links': [], 'truncated': False, 'checked_date': self.record['checked_date']}
         with patch('web.agent_runtime.fetch_page', new=AsyncMock(return_value=page)):
             job = await self.run_model(model, research=True)
         self.assertEqual(job['status'], 'completed', job['events'])
-        evidence = kb.read_json(self.store.home('alpha') / 'evidence/read-then-archived.json')
-        self.assertEqual(evidence['checked_date'], self.record['checked_date'])
-        self.assertEqual(evidence['status'], 'reported')
+        self.assertFalse((self.store.home('alpha') / 'evidence/read-then-reviewed.json').exists())
+        event = next(event for event in job['events'] if event['type'] == 'verification_required')
+        from .verification import VerificationQueue
+        review = VerificationQueue(self.store).get('alpha', event['id'])
+        self.assertEqual(review['status'], 'pending')
+        self.assertEqual(review['source']['checked_date'], self.record['checked_date'])
+        self.assertEqual(review['candidates'][0]['status'], 'reported')
+        self.assertFalse(any(event['type'] == 'archived' for event in job['events']))
+        self.assertEqual(job['events'][-1]['archived_ids'], [])
+        self.assertEqual(job['events'][-1]['pending_review_ids'], [review['id']])
+        note = kb.read_json(self.root / 'reports/agent-runs' / (job['id'] + '.json'))
+        self.assertEqual(note['pending_review_ids'], [review['id']])
+        self.assertEqual(note['archived_ids'], [])
 
 
 if __name__ == '__main__':

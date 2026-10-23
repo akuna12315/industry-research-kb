@@ -247,7 +247,7 @@ async function harness(evaluatedSource = source) {
   const fallback = request => {
     if (request.path === '/api/state') return clone(state);
     if (request.path.startsWith('/api/sources/')) return {mode: 'preferred', sources: []};
-    if (['/api/materials', '/api/evidence', '/api/reports', '/api/memories', '/api/conversations', '/api/crawls'].includes(request.path)) return [];
+    if (['/api/materials', '/api/evidence', '/api/reports', '/api/memories', '/api/conversations', '/api/crawls', '/api/verifications'].includes(request.path)) return [];
     throw new Error('Unmocked request: ' + request.method + ' ' + request.url);
   };
   class OfflineEventSource {
@@ -958,6 +958,501 @@ test('URL and answer markup reject active content while retaining safe citations
   assertNoMarkupInjection(container);
   assert.equal(container.querySelector('a').getAttribute('href'), 'https://example.org/a?q=1&b=2');
   assert.equal(container.querySelector('a').getAttribute('rel'), 'noopener noreferrer');
+});
+
+function markdownDOM(h, text) {
+  const container = h.document.createElement('div');
+  container.innerHTML = h.app.markdown(text);
+  return container;
+}
+
+test('assistant Chinese tables have a header, body and keyboard-accessible scroll region', async () => {
+  const h = await harness();
+  const container = markdownDOM(h, '以下为资料比较：\n\n| 资料 | 核验结果 |\n| --- | --- |\n| 造林方案 | 待核验 |\n| 批复文件 | 已通过 |\n\n仍需结合适用地区。');
+  const wrapper = container.querySelector('.markdown-table-wrap');
+  assert.ok(wrapper, 'a Markdown table needs its own horizontal scrolling region');
+  assert.equal(wrapper.getAttribute('role'), 'region');
+  assert.equal(wrapper.getAttribute('tabindex'), '0');
+  assert.ok(wrapper.getAttribute('aria-label'), 'the table region needs an accessible name');
+  const table = wrapper.querySelector('.markdown-table');
+  assert.ok(table);
+  assert.deepEqual(table.querySelector('thead').querySelectorAll('th').map(cell => cell.textContent), ['资料', '核验结果']);
+  const rows = table.querySelector('tbody').querySelectorAll('tr');
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.map(row => row.querySelectorAll('td').map(cell => cell.textContent)), [['造林方案', '待核验'], ['批复文件', '已通过']]);
+  assert.match(container.textContent, /以下为资料比较/);
+  assert.match(container.textContent, /仍需结合适用地区/);
+  assert.doesNotMatch(table.textContent, /---/, 'the delimiter row is syntax, not a data row');
+});
+
+test('table delimiter alignment applies to both headers and body cells', async () => {
+  const h = await harness();
+  const table = markdownDOM(h, '| 地区 | 阶段 | 面积 |\n| :--- | :---: | ---: |\n| 江西 | 计划 | 12 |').querySelector('table');
+  assert.ok(table);
+  for (const cells of [table.querySelectorAll('th'), table.querySelectorAll('td')]) {
+    assert.equal(cells.length, 3);
+    for (const [index, alignment] of ['left', 'center', 'right'].entries()) assert.ok(cells[index].classList.contains('align-' + alignment), 'column alignment must be retained for ' + alignment);
+  }
+});
+
+test('tables accept CRLF and optional edge pipes while retaining empty cells and normalizing ragged rows', async () => {
+  const h = await harness();
+  const table = markdownDOM(h, '地区 | 状态 | 数量\r\n- | - | -\r\n甲 | | 0\r\n乙 | 待补\r\n丙 | 已通过 | 3 | 不属于表头的多余列\r\n').querySelector('table');
+  assert.ok(table, 'tables without surrounding pipes and with short valid delimiters must render');
+  const rows = table.querySelector('tbody').querySelectorAll('tr');
+  assert.deepEqual(rows.map(row => row.querySelectorAll('td').map(cell => cell.textContent)), [['甲', '', '0'], ['乙', '待补', ''], ['丙', '已通过', '3']]);
+  assert.equal(table.querySelectorAll('td').length, 9);
+  assert.doesNotMatch(table.textContent, /多余列/);
+});
+
+test('escaped pipes and matched inline code do not split table cells', async () => {
+  const h = await harness();
+  const table = markdownDOM(h, '| 地区\\|类型 | 表达式 | 结果 |\n| --- | --- | --- |\n| 甲\\|乙 | `a|b` | 保留 |\n| 丙 | ``a`|b`` | 双反引号 |').querySelector('table');
+  assert.ok(table);
+  assert.deepEqual(table.querySelectorAll('th').map(cell => cell.textContent), ['地区|类型', '表达式', '结果']);
+  const rows = table.querySelector('tbody').querySelectorAll('tr');
+  assert.deepEqual(rows.map(row => row.querySelectorAll('td').map(cell => cell.textContent)), [['甲|乙', 'a|b', '保留'], ['丙', 'a`|b', '双反引号']]);
+  assert.deepEqual(table.querySelectorAll('code').map(code => code.textContent), ['a|b', 'a`|b']);
+});
+
+test('escaped pipes inside table code spans display as literal pipes', async () => {
+  const h = await harness();
+  const table = markdownDOM(h, '| 表达式 | 状态 |\n| --- | --- |\n| `a\\|b` | 保留原意 |').querySelector('table');
+  assert.ok(table);
+  const cells = table.querySelector('tbody').querySelectorAll('td');
+  assert.equal(cells.length, 2);
+  assert.equal(cells[0].querySelector('code').textContent, 'a|b');
+  assert.equal(cells[1].textContent, '保留原意');
+});
+
+test('unwrapped table rows beginning with list or heading markers remain table data', async () => {
+  const h = await harness();
+  const container = markdownDOM(h, '标识 | 内容\n--- | ---\n- | 待补 |\n# 标识 | 内容\n\n后续说明。');
+  const table = container.querySelector('table');
+  assert.ok(table);
+  assert.deepEqual(table.querySelector('tbody').querySelectorAll('tr').map(row => row.querySelectorAll('td').map(cell => cell.textContent)), [['-', '待补'], ['# 标识', '内容']]);
+  assert.equal(container.querySelector('h3'), null, 'a leading hash in a table cell is data');
+  assert.match(container.textContent, /后续说明/);
+});
+
+test('table cells retain citations, emphasis and literal code without interpreting code markup', async () => {
+  const h = await harness();
+  const container = markdownDOM(h, '| 重点 | 依据 | 原样示例 |\n| --- | --- | --- |\n| **适用范围** | [原始来源](https://example.org/a?q=1&b=2) | `<img src=x onerror=alert(1)> **原样**` |');
+  const table = container.querySelector('table');
+  assert.ok(table);
+  assert.equal(table.querySelector('strong').textContent, '适用范围');
+  assert.equal(table.querySelectorAll('strong').length, 1, 'emphasis syntax inside code must remain literal');
+  const citation = table.querySelector('a');
+  assert.equal(citation.textContent, '原始来源');
+  assert.equal(citation.getAttribute('href'), 'https://example.org/a?q=1&b=2');
+  assert.equal(citation.getAttribute('target'), '_blank');
+  assert.equal(citation.getAttribute('rel'), 'noopener noreferrer');
+  assert.equal(table.querySelector('code').textContent, '<img src=x onerror=alert(1)> **原样**');
+  assertNoMarkupInjection(container);
+});
+
+test('ordinary pipe text and invalid delimiter rows do not become tables', async () => {
+  const h = await harness();
+  for (const text of [
+    '地区 | 状态\n江西 | 待核验',
+    '地区 | 状态\n--- | 非分隔线',
+    '地区 | 状态\n--- | --- | ---',
+    '地区 | 状态\n--- |',
+    '地区 | 状态\n--- | -:-',
+    '地区 | 状态\n=== | ==='
+  ]) {
+    const container = markdownDOM(h, text);
+    assert.equal(container.querySelector('table'), null, 'not every answer containing pipes is a table: ' + text);
+    assert.match(container.textContent, /地区/);
+  }
+});
+
+test('fenced Markdown examples remain code and do not consume a following real table', async () => {
+  const h = await harness();
+  const example = '| 示例 | 内容 |\n| --- | --- |\n| **原样** | <img src=x onerror=alert(1)> |';
+  for (const fence of ['```markdown', '~~~markdown']) {
+    const closing = fence.startsWith('`') ? '```' : '~~~';
+    const container = markdownDOM(h, fence + '\n' + example + '\n' + closing + '\n\n| 真实表 | 状态 |\n| --- | --- |\n| 合成资料 | 待核验 |');
+    assert.equal(container.querySelectorAll('table').length, 1, 'fenced table source must not render as another table');
+    assert.equal(container.querySelector('table').querySelector('th').textContent, '真实表');
+    assert.match(container.querySelector('pre').querySelector('code').textContent, /\| \*\*原样\*\* \| <img/);
+    assert.equal(container.querySelector('pre').querySelector('strong'), null);
+    assertNoMarkupInjection(container);
+  }
+  const unclosed = markdownDOM(h, '```\n' + example);
+  assert.equal(unclosed.querySelector('table'), null, 'an unfinished code example must remain code through the end');
+  assert.ok(unclosed.querySelector('pre'));
+});
+
+test('table cell content and citation URLs cannot add active markup or corrupt link attributes', async () => {
+  const h = await harness();
+  const container = markdownDOM(h, '| 标题 | 来源 |\n| --- | --- |\n| <img src=x onerror=alert(1)><script>bad</script> | [引文 <img src=x onerror=alert(1)>](https://example.org/search?q="quoted"&a=1) |\n| **重点** | [危险来源](javascript:alert(1)) |');
+  assert.ok(container.querySelector('table'));
+  assertNoMarkupInjection(container);
+  const links = container.querySelectorAll('a');
+  assert.ok(links.length >= 1, 'safe citation links must survive escaping');
+  assert.equal(links[0].getAttribute('href'), 'https://example.org/search?q=%22quoted%22&a=1');
+  assert.match(links[0].textContent, /引文 <img/);
+  for (const link of links) assert.ok(!/^\s*(?:javascript|data):/i.test(link.getAttribute('href') || ''), 'active protocols must not become links');
+  assert.match(container.textContent, /<script>bad<\/script>/);
+});
+
+test('live SSE answers and reopened history share the same table rendering', async () => {
+  const h = await harness();
+  const answer = '核验情况：\n\n| 资料 | 结论 |\n| --- | --- |\n| **合成方案** | 待用户确认 |\n\n请核对原文。';
+  h.handler = (request, fallback) => {
+    if (request.path === '/api/agent/jobs') return {id: 'table-agent', conversation: 'table-chat'};
+    if (request.path === '/api/conversations') return [{id: 'saved-table', turns: [{at: '2026-10-20', prompt: '比较合成资料', answer}]}];
+    return fallback(request);
+  };
+  h.document.querySelector('#chat-input').value = '比较合成资料';
+  await h.app.sendAgent();
+  await h.streams[0].emit({type: 'answer', text: '核验情况：\n\n| 资料 | 结论 |'});
+  assert.equal(h.document.querySelector('#chat-log').querySelector('table'), null, 'an incomplete answer must not fabricate a table header');
+  await h.streams[0].emit({type: 'answer', text: answer});
+  const live = h.document.querySelector('#chat-log').querySelector('.answer-markdown');
+  assert.equal(live.querySelectorAll('table').length, 1);
+  assert.equal(live.querySelector('strong').textContent, '合成方案');
+  const liveCells = live.querySelectorAll('th').concat(live.querySelectorAll('td')).map(cell => cell.textContent);
+  await h.streams[0].emit({type: 'answer', text: answer});
+  assert.equal(live.querySelectorAll('table').length, 1, 'answer replacement must not append duplicate tables');
+  await h.streams[0].emit({type: 'done', archived_ids: []});
+  h.app.S.view = 'settings';
+  await h.app.render();
+  await h.document.dispatch('click', h.document.querySelector('[data-action="view-conversation"]'));
+  const history = h.document.querySelector('#dialog-body').querySelector('.answer-markdown');
+  assert.ok(history, 'history needs the same table typography and scroll rules as live answers');
+  assert.equal(history.querySelectorAll('table').length, 1);
+  assert.deepEqual(history.querySelectorAll('th').concat(history.querySelectorAll('td')).map(cell => cell.textContent), liveCells);
+  assert.match(history.textContent, /请核对原文/);
+  assert.equal(h.errors.length, 0);
+});
+
+function extractionJob(changes={}) {
+  return {id:'extraction-a',industry_id:'alpha',material_id:'material-a',title:'合成全文提取任务',status:'running',progress:{completed:2,total:155,failed:0,processed_characters:20000,total_characters:1000000,evidence_count:9,processed_tables:3,total_tables:455,unprocessed_images:135},coverage_note:'只处理文字及表格，图片未识别',...changes};
+}
+
+function verification(changes={}) {
+  return {id:'review-a',industry_id:'alpha',material_id:'material-a',title:'合成资料核验',status:'pending',mode:'manual',
+    source:{kind:'material',title:'合成原件'},excerpts:[{citation:'material-a#block-2-chars-1-12',location:'段落 3 至表格 1 单元格 2',text:'计划建设示范林，仅为测试。'}],
+    candidates:[{title:'资料记载的计划',summary:'计划建设示范林。',quote:'计划建设示范林',citation:'material-a#block-2-chars-1-12',status:'planned',category:'政策',region:'甲地区'}],
+    findings:['需区分计划与项目批复'],coverage_note:'仅抽取部分片段，不代表全文核验。',...changes};
+}
+test('one manual approval automatically extracts evidence with no extra form fields', async()=>{
+  const h=await harness(),draft=verification();let approved=false;
+  h.app.S.view='materials';
+  h.handler=(request,fallback)=>{
+    if(request.path==='/api/materials')return [material({verification_status:approved?'reviewed':'unverified'})];
+    if(request.path==='/api/verifications')return approved?[]:[draft];
+    if(request.path==='/api/verifications/materials')return {items:[draft],errors:[]};
+    if(request.path.endsWith('/decision')){approved=true;return {...draft,status:'approved',extraction_status:'completed',extraction_method:'model',evidence_ids:['saved-fact']};}
+    return fallback(request);
+  };
+  await h.app.render();
+  assert.doesNotMatch(h.document.querySelector('#content').textContent,/有效性待确认/);
+  assert.match(h.document.querySelector('#content').textContent,/尚未核验/);
+  const button=h.document.querySelector('[data-action="verify-material-manual"]');assert.equal(button.textContent,'通过核验');
+  assert.equal(h.calls.filter(c=>c.path.endsWith('/decision')).length,0);
+  await h.document.dispatch('click',button);
+  assert.deepEqual(h.calls.find(c=>c.path==='/api/verifications/materials').body,{items:[{industry_id:'alpha',material_id:'material-a'}],mode:'manual'});
+  const form=h.document.querySelector('#verification-decision-form');
+  assert.equal(form.querySelector('input'),null);assert.equal(form.querySelector('textarea'),null);assert.equal(form.querySelector('select'),null);
+  const decisions=h.calls.filter(c=>c.path.endsWith('/decision'));assert.equal(decisions.length,1);assert.deepEqual(decisions[0].body,{decision:'approve'});
+  assert.match(form.textContent,/已提取并入库1条证据/);assert.doesNotMatch(form.textContent,/需区分计划与项目批复/);assert.equal(h.document.querySelector('#dialog').open,false);assert.match(h.document.querySelector('#toast').textContent,/核验已通过，已入库1条证据/);
+  assert.match(h.document.querySelector('#content').textContent,/核验已通过/);
+  assert.doesNotMatch(h.document.querySelector('#content').textContent,/有效性待确认/);
+  await h.document.dispatch('submit',form);assert.equal(h.calls.filter(c=>c.path.endsWith('/decision')).length,1);
+});
+
+test('automatic verification honors each material permission and displays independent failures',async()=>{
+  const h=await harness(),allowed=material({id:'allowed',model_allowed:true,sensitivity:'internal'}),blocked=material({id:'blocked',title:'未授权资料'}),restricted=material({id:'restricted',title:'受限资料',model_allowed:true,sensitivity:'restricted'});
+  h.app.S.view='materials';
+  h.handler=(request,fallback)=>{
+    if(request.path==='/api/materials')return [allowed,blocked,restricted];
+    if(request.path==='/api/verifications/materials')return {items:[],errors:[{material_id:'allowed',error:'模型未配置密钥'}]};
+    return fallback(request);
+  };
+  await h.app.render();
+  await h.document.dispatch('click',h.document.querySelectorAll('[data-action="verify-material-automatic"]')[1]);
+  assert.equal(h.calls.filter(c=>c.path==='/api/verifications/materials').length,0);
+  assert.match(h.document.querySelector('#dialog-body').textContent,/允许模型使用检索片段/);
+  assert.match(h.document.querySelector('#dialog-body').textContent,/未授权资料/);
+  const all=h.document.querySelector('#material-select-all');all.checked=true;await h.document.dispatch('change',all);
+  await h.document.dispatch('click',h.document.querySelector('[data-action="verify-selected-automatic"]'));
+  const request=h.calls.find(c=>c.path==='/api/verifications/materials');
+  assert.equal(request.body.mode,'automatic');assert.deepEqual(request.body.items,[{industry_id:'alpha',material_id:'allowed'}]);
+  const message=h.document.querySelector('#dialog-body').textContent;
+  assert.match(message,/未授权资料/);assert.match(message,/受限资料/);assert.match(message,/模型未配置密钥/);
+  assert.equal(h.calls.filter(c=>c.path.endsWith('/decision')).length,0);
+});
+
+test('automatic check shows simple findings and waits for one explicit approval',async()=>{
+  const h=await harness(),draft=verification({mode:'automatic'});h.app.S.view='materials';
+  h.handler=(request,fallback)=>{
+    if(request.path==='/api/materials')return [material({model_allowed:true})];
+    if(request.path==='/api/verifications/materials')return {items:[draft],errors:[]};
+    if(request.path.endsWith('/decision'))return {...draft,status:'approved',extraction_status:'completed',evidence_ids:['fact']};
+    return fallback(request);
+  };
+  await h.app.render();await h.document.dispatch('click',h.document.querySelector('[data-action="verify-material-automatic"]'));
+  const form=h.document.querySelector('#verification-decision-form');
+  assert.match(form.textContent,/需区分计划与项目批复/);assert.match(form.textContent,/不代表全文核验/);
+  assert.equal(form.querySelector('input'),null);assert.equal(form.querySelector('textarea'),null);assert.equal(form.querySelector('details'),null);
+  assert.equal(h.calls.filter(c=>c.path.endsWith('/decision')).length,0);
+  await h.document.dispatch('submit',form);
+  assert.deepEqual(h.calls.find(c=>c.path.endsWith('/decision')).body,{decision:'approve'});
+});
+
+test('material selection limits each batch to ten and keeps preparation failures beside successful automatic imports',async()=>{
+  const h=await harness(),records=Array.from({length:11},(_,index)=>material({id:'m'+index,title:'资料'+index}));h.app.S.view='materials';
+  h.handler=(request,fallback)=>{
+    if(request.path==='/api/materials')return records;
+    if(request.path==='/api/verifications/materials')return {items:[verification({material_id:'m0'})],errors:[{material_id:'m1',error:'没有原文片段'}]};
+    if(request.path.endsWith('/decision'))return {status:'approved',extraction_status:'completed',evidence_ids:['fact']};
+    return fallback(request);
+  };
+  await h.app.render();const all=h.document.querySelector('#material-select-all');all.checked=true;await h.document.dispatch('change',all);
+  assert.equal(all.checked,false);assert.match(h.document.querySelector('#toast').textContent,/最多核验10份/);
+  const picks=h.document.querySelectorAll('[name="material-pick"]');for(const pick of picks){pick.checked=true;await h.document.dispatch('change',pick);}
+  assert.equal(picks[10].checked,false);
+  await h.document.dispatch('click',h.document.querySelector('[data-action="verify-selected-manual"]'));
+  assert.equal(h.calls.find(c=>c.path==='/api/verifications/materials').body.items.length,10);
+  assert.match(h.document.querySelector('#dialog-body').textContent,/m1：没有原文片段/);assert.equal(h.document.querySelector('#dialog').open,true);
+  assert.match(h.document.querySelector('#verification-results').textContent,/已提取并入库1条证据/);
+});
+
+test('batch confirmation is a simple list and retry skips successful items',async()=>{
+  const h=await harness(),reviews=[verification(),verification({id:'review-b',material_id:'material-b',title:'第二份核验'})];let secondFails=true;
+  const approved=new Set();h.app.S.view='materials';
+  h.handler=(request,fallback)=>{
+    if(request.path==='/api/verifications')return reviews.filter(r=>!approved.has(r.id));
+    if(request.path==='/api/verifications/alpha/review-a')return reviews[0];
+    if(request.path==='/api/verifications/alpha/review-b')return reviews[1];
+    if(request.path.endsWith('/decision')){if(request.path.includes('review-b')&&secondFails)throw new Error('资料版本已变化');const id=request.path.split('/').at(-2);approved.add(id);return {status:'approved',extraction_status:'completed',evidence_ids:['fact-'+id]};}
+    return fallback(request);
+  };
+  await h.app.render();await h.document.dispatch('click',h.document.querySelector('[data-action="verification-queue"]'));
+  for(const pick of h.document.querySelectorAll('[name="verification-pick"]'))pick.checked=true;
+  await h.document.dispatch('click',h.document.querySelector('[data-action="preview-verifications"]'));
+  const form=h.document.querySelector('#verification-decision-form');assert.equal(form.querySelector('input'),null);assert.equal(form.querySelector('textarea'),null);assert.equal(form.querySelector('[type="submit"]').textContent,'全部通过');
+  await h.document.dispatch('submit',form);
+  assert.match(h.document.querySelector('#verification-results').textContent,/合成资料核验：核验已通过/);
+  assert.match(h.document.querySelector('#verification-results').textContent,/第二份核验：失败，资料版本已变化/);
+  secondFails=false;await h.document.dispatch('submit',form);
+  assert.equal(h.calls.filter(c=>c.path.includes('review-a/decision')).length,1);assert.equal(h.calls.filter(c=>c.path.includes('review-b/decision')).length,2);
+  assert.ok(h.calls.filter(c=>c.path.endsWith('/decision')).every(c=>JSON.stringify(c.body)==='{"decision":"approve"}'));
+});
+
+test('one batch rejection rejects all checked materials and never requests evidence extraction',async()=>{
+  const h=await harness(),reviews=[verification({mode:'automatic'}),verification({id:'review-b',title:'第二份核验',mode:'automatic'})];h.app.S.view='materials';
+  h.handler=(request,fallback)=>{
+    if(request.path==='/api/verifications/materials')return {items:reviews,errors:[]};
+    if(request.path==='/api/materials')return [material({model_allowed:true})];
+    if(request.path.endsWith('/decision'))return {status:'rejected',evidence_ids:[]};return fallback(request);
+  };
+  await h.app.render();await h.document.dispatch('click',h.document.querySelector('[data-action="verify-material-automatic"]'));
+  await h.document.dispatch('click',h.document.querySelector('[data-action="reject-verifications"]'));
+  const decisions=h.calls.filter(c=>c.path.endsWith('/decision'));assert.equal(decisions.length,2);assert.ok(decisions.every(c=>JSON.stringify(c.body)==='{"decision":"reject"}'));
+  assert.match(h.document.querySelector('#verification-results').textContent,/第二份核验：暂不通过，未入库/);
+});
+
+test('approval is single-flight and cannot overwrite a newer dialog',async()=>{
+  const h=await harness(),pending=deferred(),draft=verification();h.app.S.view='materials';
+  h.handler=(request,fallback)=>{
+    if(request.path==='/api/materials')return [material()];if(request.path==='/api/verifications/materials')return {items:[draft],errors:[]};if(request.path.endsWith('/decision'))return pending.promise;return fallback(request);
+  };
+  await h.app.render();const button=h.document.querySelector('[data-action="verify-material-manual"]'),first=h.document.dispatch('click',button);
+  for(let i=0;i<25;++i)await Promise.resolve();
+  const form=h.document.querySelector('#verification-decision-form');assert.ok(form);await h.document.dispatch('submit',form);
+  assert.equal(h.calls.filter(c=>c.path.endsWith('/decision')).length,1);
+  h.app.materialDialog({title:'核验请求期间打开的新资料草稿'});const newer=h.document.querySelector('#material-form');
+  pending.resolve({...draft,status:'approved',extraction_status:'completed',evidence_ids:['saved']});await first;
+  assert.equal(h.document.querySelector('#material-form'),newer);assert.equal(newer.elements.namedItem('title').value,'核验请求期间打开的新资料草稿');assert.equal(h.document.querySelector('#verification-results'),null);assert.equal(h.errors.length,0);
+});
+
+test('extraction failure preserves approval and one retry completes automatic import',async()=>{
+  const h=await harness(),draft=verification();let attempts=0;h.app.S.view='materials';
+  h.handler=(request,fallback)=>{
+    if(request.path==='/api/materials')return [material()];if(request.path==='/api/verifications/materials')return {items:[draft],errors:[]};
+    if(request.path.endsWith('/decision')){attempts++;return {...draft,status:'approved',extraction_status:attempts===1?'failed':'completed',extraction_error:attempts===1?'模型暂时不可用':'',evidence_ids:attempts===1?[]:['fact']};}return fallback(request);
+  };
+  await h.app.render();await h.document.dispatch('click',h.document.querySelector('[data-action="verify-material-manual"]'));
+  const form=h.document.querySelector('#verification-decision-form');assert.match(form.textContent,/资料已通过，证据提取失败，可重试/);assert.doesNotMatch(form.querySelector('#verification-results').textContent,/已入库/);assert.equal(form.querySelector('[type="submit"]').textContent,'重试提取');assert.equal(form.querySelector('[type="submit"]').disabled,false);assert.equal(form.querySelector('[data-action="reject-verifications"]').disabled,true);assert.equal(h.document.querySelector('#dialog').open,true);assert.equal((form.textContent.match(/资料已通过，证据提取失败，可重试/g)||[]).length,1);
+  await h.document.dispatch('submit',form);assert.equal(attempts,2);assert.match(form.textContent,/已提取并入库1条证据/);
+  await h.document.dispatch('submit',form);assert.equal(attempts,2);
+});
+
+test('reviewed materials offer one-click full re-extraction without another approval',async()=>{
+  const h=await harness(),record=material({verification_status:'reviewed',verification:{review_id:'review-a',extraction_status:'failed'}}),job=extractionJob({status:'waiting_model'});h.app.S.view='materials';
+  h.handler=(request,fallback)=>{
+    if(request.path==='/api/materials')return [record];if(request.path==='/api/materials/alpha/material-a')return record;
+    if(request.path==='/api/materials/alpha/material-a/extractions'){record.extraction_job=job;return {job};}return fallback(request);
+  };
+  await h.app.render();assert.ok(h.document.querySelector('[data-action="restart-material-extraction"]'));
+  await h.document.dispatch('click',h.document.querySelector('[data-action="view-material"]'));assert.match(h.document.querySelector('#dialog-body').textContent,/有效性待确认/);
+  await h.document.dispatch('click',h.document.querySelector('#dialog-body').querySelector('[data-action="restart-material-extraction"]'));
+  assert.equal(h.calls.filter(c=>c.path.includes('/verifications/')&&c.method==='POST').length,0);
+  assert.deepEqual(h.calls.find(c=>c.path.endsWith('/extractions')).body,{restart:true});assert.match(h.document.querySelector('#dialog-body').textContent,/等待模型配置/);assert.doesNotMatch(h.document.querySelector('#dialog-body').textContent,/已保存.*原文摘录/);
+});
+
+test('legacy pending approval without a task does not pretend extraction is running',async()=>{
+  const h=await harness(),draft=verification();h.app.S.view='materials';
+  h.handler=(request,fallback)=>{
+    if(request.path==='/api/materials')return [material({verification_status:'reviewed',verification:{extraction_status:'pending'}})];
+    if(request.path==='/api/verifications/materials')return {items:[draft],errors:[]};
+    if(request.path.endsWith('/decision'))return {...draft,status:'approved',extraction_status:'pending',evidence_ids:[]};return fallback(request);
+  };
+  // A current-version approval still exposes the restart action when old extraction has no durable task.
+  await h.app.render();assert.match(h.document.querySelector('#content').textContent,/尚无全文提取任务/);assert.ok(h.document.querySelector('[data-action="restart-material-extraction"]'));assert.doesNotMatch(h.document.querySelector('#content').textContent,/正在提取证据/);
+  // Reproduce an old approved review result through the normal queue path.
+  const pick=h.document.querySelector('[name="material-pick"]');pick.checked=true;await h.document.dispatch('change',pick);await h.document.dispatch('click',h.document.querySelector('[data-action="verify-selected-manual"]'));
+  const form=h.document.querySelector('#verification-decision-form');assert.match(form.textContent,/尚无全文提取任务/);assert.doesNotMatch(form.textContent,/正在提取证据|已完成|未提取到可入库/);assert.equal(form.querySelector('[type="submit"]').disabled,true);assert.equal(form.querySelector('[data-action="refresh-verifications"]').hidden,true);assert.equal(h.calls.filter(c=>c.path.endsWith('/decision')).length,1);
+});
+
+test('material list and detail show background extraction progress and job controls',async()=>{
+  const h=await harness(),job=extractionJob(),record=material({verification_status:'reviewed',extraction_job:job});h.app.S.view='materials';
+  h.handler=(request,fallback)=>{
+    if(request.path==='/api/materials')return [record];if(request.path==='/api/materials/alpha/material-a')return record;if(request.path==='/api/extractions/alpha/extraction-a')return job;return fallback(request);
+  };
+  await h.app.render();assert.match(h.document.querySelector('#content').textContent,/已处理 2 \/ 155 批/);assert.equal(h.document.querySelector('[data-action="verify-material-manual"]'),null);assert.equal(h.document.querySelector('[data-action="restart-material-extraction"]').disabled,true);
+  assert.equal(h.document.querySelector('progress').getAttribute('value'),'2','进度按唯一原文字符计算');
+  await h.document.dispatch('click',h.document.querySelector('[data-action="view-extraction"]'));assert.match(h.document.querySelector('#dialog-body').textContent,/字符 20,000 \/ 1,000,000/);assert.match(h.document.querySelector('#dialog-body').textContent,/未处理图片 135/);
+  await h.document.dispatch('click',h.document.querySelector('#dialog-body').querySelector('[data-action="view-material"]'));assert.ok(h.document.querySelector('#dialog-body').querySelector('[data-action="restart-material-extraction"]'));assert.equal(h.calls.filter(c=>c.path.includes('/verifications/')&&c.method==='POST').length,0);
+});
+
+test('Agent card approves directly without a second review dialog and is single-flight',async()=>{
+  const h=await harness(),pending=deferred();h.handler=(request,fallback)=>request.path==='/api/agent/jobs'?{id:'verify-agent',conversation:'verify-chat'}:request.path.endsWith('/decision')?pending.promise:fallback(request);
+  h.document.querySelector('#chat-input').value='请核验这份资料';await h.app.sendAgent();await h.streams[0].emit({type:'verification_required',id:'review-a',industry_id:'alpha',title:'合成资料'});
+  const card=h.document.querySelector('.verification-required');assert.match(card.textContent,/是否通过资料核验/);assert.equal(h.calls.filter(c=>c.path.endsWith('/decision')).length,0);
+  const button=card.querySelector('.primary'),first=h.document.dispatch('click',button);await h.document.dispatch('click',button);assert.equal(h.calls.filter(c=>c.path.endsWith('/decision')).length,1);assert.equal(h.document.querySelector('#verification-decision-form'),null);
+  pending.resolve({status:'approved',extraction_status:'completed',evidence_ids:['agent-fact']});await first;assert.match(card.textContent,/已提取并入库1条证据/);assert.equal(button.disabled,true);assert.deepEqual(h.calls.find(c=>c.path.endsWith('/decision')).body,{decision:'approve'});
+  const before=h.calls.filter(c=>c.path==='/api/state').length;await h.streams[0].emit({type:'done',archived_ids:[],pending_review_ids:['review-a']});assert.equal(h.calls.filter(c=>c.path==='/api/state').length,before+1);
+});
+
+test('Agent card rejection never approves or extracts evidence',async()=>{
+  const h=await harness();h.handler=(request,fallback)=>request.path==='/api/agent/jobs'?{id:'reject-agent',conversation:'reject-chat'}:request.path.endsWith('/decision')?{status:'rejected',evidence_ids:[]}:fallback(request);
+  h.document.querySelector('#chat-input').value='导入资料';await h.app.sendAgent();await h.streams[0].emit({type:'verification_required',id:'review-a',industry_id:'alpha',title:'合成资料'});
+  const card=h.document.querySelector('.verification-required');await h.document.dispatch('click',card.querySelector('.secondary'));assert.deepEqual(h.calls.find(c=>c.path.endsWith('/decision')).body,{decision:'reject'});assert.match(card.textContent,/暂不通过，未入库/);assert.equal(card.querySelector('.primary').disabled,true);
+});
+
+test('Agent extraction failure retries approval and pending extraction never claims import success',async()=>{
+  const h=await harness();let attempts=0;h.handler=(request,fallback)=>{
+    if(request.path==='/api/agent/jobs')return {id:'retry-agent',conversation:'retry-chat'};
+    if(request.path.endsWith('/decision')){attempts++;return {status:'approved',extraction_status:attempts===1?'failed':'pending',extraction_error:attempts===1?'稍后重试':'',evidence_ids:[]};}return fallback(request);
+  };
+  h.document.querySelector('#chat-input').value='导入资料';await h.app.sendAgent();await h.streams[0].emit({type:'verification_required',id:'review-a',industry_id:'alpha',title:'合成资料'});const card=h.document.querySelector('.verification-required'),button=card.querySelector('.primary');
+  await h.document.dispatch('click',button);assert.equal(button.textContent,'重试提取');assert.match(card.textContent,/资料已通过，证据提取失败，可重试/);
+  await h.document.dispatch('click',button);assert.equal(attempts,2);assert.match(card.textContent,/资料已通过，尚无全文提取任务/);assert.equal(button.textContent,'核验已通过');assert.equal(button.disabled,true);assert.doesNotMatch(card.querySelector('[role="status"]').textContent,/未提取到|已入库|失败/);
+});
+
+test('verification titles sources findings and Agent card escape active markup without candidate fields',async()=>{
+  const h=await harness(),attack='"><img src=x onerror=alert(1)><script>bad</script>',draft=verification({title:attack,source:{title:attack},coverage_note:attack,findings:[attack],mode:'automatic'});
+  draft.excerpts=[{citation:attack,location:attack,text:attack}];h.handler=(request,fallback)=>{
+    if(request.path==='/api/agent/jobs')return {id:'xss-agent',conversation:'xss-chat'};if(request.path==='/api/verifications')return [draft];if(request.path==='/api/verifications/alpha/review-a')return draft;return fallback(request);
+  };
+  h.document.querySelector('#chat-input').value='测试转义';await h.app.sendAgent();await h.streams[0].emit({type:'verification_required',id:'review-a',industry_id:'alpha',title:attack,detail:attack});assertNoMarkupInjection(h.document.querySelector('.verification-required'));
+  h.app.S.view='materials';await h.app.render();await h.document.dispatch('click',h.document.querySelector('[data-action="verification-queue"]'));await h.document.dispatch('click',h.document.querySelector('[data-action="open-verification"]'));
+  assertNoMarkupInjection(h.document.querySelector('#dialog-body'));assert.equal(h.document.querySelector('[data-candidate-field="title"]'),null);assert.match(h.document.querySelector('#dialog-body').textContent,/onerror/);
+});
+
+test('local evidence links back to its material, exact block and related evidence without empty URL links',async()=>{
+  const h=await harness(),record=evidence({url:'',material_source:{industry_id:'alpha',material_id:'material-a',citation:'material-a#block-2-chars-1-10',quote:'引用原文'},history:[]}),original=material({title:'原始合成资料',content:'引用原文',related_evidence_ids:['evidence-a'],extraction:{text_index:'test-index'}});
+  h.app.S.view='evidence';
+  h.handler=(request,fallback)=>{
+    if(request.path==='/api/evidence')return [record];
+    if(request.path==='/api/evidence/alpha/evidence-a')return record;
+    if(request.path==='/api/materials/alpha/material-a')return original;
+    if(request.path==='/api/materials/alpha/material-a/sections')return {total:4,items:[{index:2,first_location:'段落 3',last_location:'段落 4',text:'引用原文'}]};
+    return fallback(request);
+  };
+  await h.app.render();assert.equal(h.document.querySelector('[data-record]').querySelector('a'),null);
+  await h.document.dispatch('click',h.document.querySelector('[data-record]'));
+  assert.equal(h.document.querySelector('#dialog-body').querySelector('a'),null);
+  assert.match(h.document.querySelector('#dialog-body').textContent,/material-a#block-2/);
+  await h.document.dispatch('click',h.document.querySelector('#locate-evidence-material'));
+  assert.equal(h.calls.filter(c=>c.path.endsWith('/sections')).at(-1).query.get('offset'),'1');
+  assert.match(h.document.querySelector('#dialog-body').textContent,/段落 3/);
+  await h.document.dispatch('click',h.document.querySelector('#section-back'));
+  assert.equal(h.document.querySelector('#dialog-title').textContent,'原始合成资料');
+  await h.document.dispatch('click',h.document.querySelector('[data-action="view-related-evidence"]'));
+  assert.equal(h.document.querySelector('#dialog-title').textContent,'合成证据');
+  assert.equal(h.errors.length,0);
+});
+
+test('full extraction polls progress in place and preserves an unrelated edit dialog',async()=>{
+  const h=await harness(),job=extractionJob(),record=material({verification_status:'reviewed',extraction_job:job});h.app.S.view='materials';
+  h.handler=(request,fallback)=>request.path==='/api/materials'?[record]:request.path==='/api/extractions/alpha/extraction-a'?{...job,progress:{...job.progress,completed:41,evidence_count:106}}:fallback(request);
+  await h.app.render();h.app.materialDialog({industry_id:'alpha',title:'尚未保存的草稿'});const form=h.document.querySelector('#material-form');
+  const poll=[...h.timers.values()].at(-1);assert.ok(poll);await poll();assert.match(h.document.querySelector('#content').textContent,/已处理 41 \/ 155 批/);assert.equal(h.document.querySelector('#material-form'),form);assert.equal(form.elements.namedItem('title').value,'尚未保存的草稿');assert.equal(h.calls.filter(c=>c.path==='/api/materials').length,1,'polling must not rerender the whole library');
+  assert.equal(h.document.querySelector('progress').getAttribute('value'),'2','批次数变化不会虚增原文覆盖');
+});
+
+test('full extraction stops polling on completion and keeps images explicitly unprocessed',async()=>{
+  const h=await harness(),job=extractionJob(),record=material({verification_status:'reviewed',extraction_job:job});h.app.S.view='materials';
+  h.handler=(request,fallback)=>request.path==='/api/materials'?[record]:request.path==='/api/extractions/alpha/extraction-a'?{...job,status:'completed',progress:{...job.progress,completed:155,evidence_count:800,processed_tables:455}}:fallback(request);
+  await h.app.render();await [...h.timers.values()].at(-1)();assert.match(h.document.querySelector('#content').textContent,/全文文字及表格处理完成；图片 135 张未处理/);assert.equal(h.document.querySelector('[data-action="restart-material-extraction"]').disabled,false);
+  const count=h.calls.filter(c=>c.path.includes('/extractions/')).length;await [...h.timers.values()].at(-1)();assert.equal(h.calls.filter(c=>c.path.includes('/extractions/')).length,count,'terminal tasks do not make another polling request');
+});
+
+test('pause resume and failed-batch retry use task controls without another verification',async()=>{
+  const h=await harness(),job=extractionJob(),record=material({verification_status:'reviewed',extraction_job:job});h.app.S.view='materials';
+  h.handler=(request,fallback)=>{if(request.path==='/api/materials')return [record];if(request.path==='/api/extractions/alpha/extraction-a')return job;if(request.path.endsWith('/control')){job.status=request.body.action==='pause'?'paused':'running';return {job};}return fallback(request);};
+  await h.app.render();await h.document.dispatch('click',h.document.querySelector('[data-control="pause"]'));assert.match(h.document.querySelector('#content').textContent,/已暂停/);await h.document.dispatch('click',h.document.querySelector('[data-control="resume"]'));
+  job.status='partial';job.error='第三批格式错误';job.progress.failed=1;await h.app.render();assert.match(h.document.querySelector('#content').textContent,/失败 1 批/);await h.document.dispatch('click',h.document.querySelector('[data-control="retry"]'));
+  assert.deepEqual(h.calls.filter(c=>c.path.endsWith('/control')).map(c=>c.body.action),['pause','resume','retry']);assert.equal(h.calls.filter(c=>c.path.includes('/verifications/')&&c.method==='POST').length,0);
+});
+
+test('waiting model and permission tasks do not claim completion or start polling',async()=>{
+  const h=await harness(),records=[material({verification_status:'reviewed',extraction_job:extractionJob({status:'waiting_model'})}),material({id:'material-b',verification_status:'reviewed',extraction_job:extractionJob({id:'extraction-b',material_id:'material-b',status:'waiting_permission'})})];h.app.S.view='materials';h.handler=(request,fallback)=>request.path==='/api/materials'?records:fallback(request);
+  await h.app.render();assert.match(h.document.querySelector('#content').textContent,/等待模型配置/);assert.match(h.document.querySelector('#content').textContent,/等待资料模型授权/);assert.equal(h.timers.size,0);assert.equal(h.document.querySelectorAll('[data-control="resume"]').length,2);assert.doesNotMatch(h.document.querySelector('#content').textContent,/全文文字及表格处理完成/);
+});
+
+test('single approval hands extraction to background and closes the completed verification interaction',async()=>{
+  const h=await harness(),draft=verification(),job=extractionJob({status:'queued'});let approved=false;h.app.S.view='materials';
+  h.handler=(request,fallback)=>{if(request.path==='/api/materials')return [material(approved?{verification_status:'reviewed',extraction_job:job}:{})];if(request.path==='/api/verifications/materials')return {items:[draft],errors:[]};if(request.path.endsWith('/decision')){approved=true;return {...draft,status:'approved',extraction_status:'pending',extraction_job:job};}return fallback(request);};
+  await h.app.render();await h.document.dispatch('click',h.document.querySelector('[data-action="verify-material-manual"]'));assert.equal(h.document.querySelector('#dialog').open,false);assert.match(h.document.querySelector('#toast').textContent,/交给后台处理/);assert.match(h.document.querySelector('#content').textContent,/等待提取/);assert.equal(h.calls.filter(c=>c.path.endsWith('/decision')).length,1);
+});
+
+test('re-extraction is single-flight and its late response preserves a newer dialog',async()=>{
+  const h=await harness(),pending=deferred(),record=material({verification_status:'reviewed'});h.app.S.view='materials';
+  h.handler=(request,fallback)=>request.path==='/api/materials'?[record]:request.path==='/api/materials/alpha/material-a/extractions'?pending.promise:fallback(request);
+  await h.app.render();const button=h.document.querySelector('[data-action="restart-material-extraction"]'),first=h.document.dispatch('click',button);await h.document.dispatch('click',button);h.app.materialDialog({industry_id:'alpha',title:'新资料草稿'});const form=h.document.querySelector('#material-form');pending.resolve(extractionJob({status:'waiting_model'}));await first;
+  assert.equal(h.calls.filter(c=>c.path.endsWith('/extractions')).length,1);assert.equal(h.document.querySelector('#material-form'),form);assert.equal(form.elements.namedItem('title').value,'新资料草稿');
+});
+
+test('source changes and rejected or pending reviews cannot inherit historical task approval',async()=>{
+  const h=await harness(),records=['invalidated','rejected','pending','unverified'].map((state,index)=>material({id:'material-'+index,title:'状态 '+state,verification_status:state,verification:{status:'reviewed',review_id:'old-review',extraction_status:'pending'},extraction_job:extractionJob({id:'job-'+index,material_id:'material-'+index,status:'completed'})}));h.app.S.view='materials';
+  h.handler=(request,fallback)=>{if(request.path==='/api/materials')return records;const original=records.find(r=>request.path==='/api/materials/alpha/'+r.id);return original||fallback(request);};
+  await h.app.render();const cards=h.document.querySelectorAll('.evidence-card');assert.equal(cards.length,4);
+  for(const card of cards){assert.doesNotMatch(card.querySelector('.verification-badges').textContent,/已通过/);assert.equal(card.querySelector('[data-action="restart-material-extraction"]'),null);assert.ok(card.querySelector('[data-action="verify-material-manual"]'));assert.doesNotMatch(card.textContent,/全文文字及表格处理完成/);}
+  assert.match(cards[0].textContent,/资料已变化，需重新核验/);assert.equal(h.timers.size,0);
+  await h.document.dispatch('click',cards[0].querySelector('[data-action="view-material"]'));assert.match(h.document.querySelector('#dialog-body').textContent,/资料已变化，需重新核验/);assert.doesNotMatch(h.document.querySelector('#dialog-body').textContent,/已通过/);assert.equal(h.document.querySelector('#dialog-body').querySelector('[data-action="restart-material-extraction"]'),null);
+});
+
+test('completed text extraction explicitly excludes tables without native text',async()=>{
+  const h=await harness(),job=extractionJob({status:'completed',progress:{completed:155,total:155,failed:0,processed_characters:1000000,total_characters:1000000,evidence_count:800,processed_tables:451,total_tables:455,tables_without_text:4,unprocessed_images:135}}),record=material({verification_status:'reviewed',extraction_job:job});h.app.S.view='materials';
+  h.handler=(request,fallback)=>request.path==='/api/materials'?[record]:request.path==='/api/extractions/alpha/extraction-a'?job:fallback(request);
+  await h.app.render();assert.match(h.document.querySelector('#content').textContent,/全文可解析文字及原生文字表格处理完成；无原生文字表格 4 个未识别；图片 135 张未处理/);assert.doesNotMatch(h.document.querySelector('#content').textContent,/全文文字及表格处理完成/);
+  await h.document.dispatch('click',h.document.querySelector('[data-action="view-extraction"]'));assert.match(h.document.querySelector('#dialog-body').textContent,/表格 451 \/ 455/);assert.match(h.document.querySelector('#dialog-body').textContent,/无原生文字表格 4 个未识别/);
+});
+
+test('completed task with inconsistent table counts cannot claim all tables are processed',async()=>{
+  const h=await harness(),record=material({verification_status:'reviewed',extraction_job:extractionJob({status:'completed'})});h.app.S.view='materials';h.handler=(request,fallback)=>request.path==='/api/materials'?[record]:fallback(request);await h.app.render();assert.match(h.document.querySelector('#content').textContent,/表格已处理 3 \/ 455（尚有表格未处理）/);assert.doesNotMatch(h.document.querySelector('#content').textContent,/全文文字及表格处理完成/);
+});
+
+test('extraction metadata and additional source supports escape active markup and locate the original',async()=>{
+  const attack='"><img src=x onerror=alert(1)><script>bad</script>',h=await harness(),job=extractionJob({status:'partial',title:attack,error:attack,coverage_note:attack,batches:[{status:'failed',error:attack}]}),record=material({verification_status:'reviewed',extraction_job:job});h.app.S.view='materials';
+  h.handler=(request,fallback)=>{if(request.path==='/api/materials')return [record];if(request.path==='/api/extractions/alpha/extraction-a')return job;if(request.path==='/api/evidence/alpha/evidence-a')return evidence({material_source:{industry_id:'alpha',material_id:'material-a',citation:'p1',quote:'首处引用'},supporting_sources:[{citation:'material-a#block-3-chars-1-4',quote:attack}]});if(request.path==='/api/materials/alpha/material-a')return material({extraction:{text_index:'synthetic'}});if(request.path.endsWith('/sections'))return {total:3,items:[{index:3,first_location:'段落3',last_location:'段落4',text:'合成原文'}]};return fallback(request);};
+  await h.app.render();assertNoMarkupInjection(h.document.querySelector('#content'));await h.document.dispatch('click',h.document.querySelector('[data-action="view-extraction"]'));assertNoMarkupInjection(h.document.querySelector('#dialog-body'));assert.match(h.document.querySelector('#dialog-body').textContent,/批次处理清单/);
+  // Open an evidence record through the real delegated route.
+  const trigger=h.document.createElement('button');trigger.dataset.action='view-related-evidence';trigger.dataset.industry='alpha';trigger.dataset.id='evidence-a';h.document.body.append(trigger);await h.document.dispatch('click',trigger);assertNoMarkupInjection(h.document.querySelector('#dialog-body'));await h.document.dispatch('click',h.document.querySelector('[data-support-index]'));assert.equal(h.calls.filter(c=>c.path.endsWith('/sections')).at(-1).query.get('offset'),'2');
+});
+
+test('hard-chunk index shows full coverage without claiming generated facts or model extraction',async()=>{
+  const h=await harness(),job=extractionJob({id:'index-material-a',mode:'hard_chunk_index',status:'completed',indexed_chunks:928,source_characters:514692,chunk_size:1200,overlap:180,coverage_note:'图片未OCR，分块不是事实证据。'}),record=material({verification_status:'reviewed',extraction_job:job});
+  h.app.S.view='materials';h.handler=(request,fallback)=>request.path==='/api/materials'?[record]:request.path==='/api/extractions/alpha/index-material-a'?job:fallback(request);
+  await h.app.render();const content=h.document.querySelector('#content');assert.match(content.textContent,/全文已索引/);assert.match(content.textContent,/928 个固定分块/);assert.match(content.textContent,/重建全文索引/);assert.doesNotMatch(content.textContent,/已入库 .* 条证据/);
+  await h.document.dispatch('click',content.querySelector('[data-action="view-extraction"]'));const detail=h.document.querySelector('#dialog-body');assert.match(detail.textContent,/导入和建索引不调用模型/);assert.match(detail.textContent,/图片未OCR/);assert.equal(detail.querySelector('[data-action="control-extraction"]'),null);
 });
 
 (async () => {

@@ -59,7 +59,7 @@ class Knowledge:
         with kb.lock(self.store.root):
             return self._save(industry, payload)
 
-    def _save(self, industry, payload, attachment=None, extraction=None, validate_only=False):
+    def _save(self, industry, payload, attachment=None, extraction=None, validate_only=False, verification=None):
         """Validate and commit while the caller holds the shared workspace lock."""
         self.store.entry(industry)
         key = ws.safe_id(payload.get('id') or 'doc-' + kb.uuid4().hex[:16])
@@ -71,6 +71,9 @@ class Knowledge:
             'sensitivity', 'model_allowed', 'related_evidence_ids', 'notes', 'project_stage',
             'coverage_period', 'scale', 'coordinate_system', 'resolution', 'superseded_by')}}
         record.update(id=key, industry_id=industry)
+        if attachment is not None:
+            record['attachment'] = attachment
+            record['extraction'] = extraction
         record['title'] = clean_text(record.get('title', ''), 300)
         if not record['title']:
             raise ValueError('请填写资料标题')
@@ -93,6 +96,14 @@ class Knowledge:
             raise ValueError('已建立原文分段索引，正文需重新上传附件更新；资料说明请使用摘要（summary）或备注（notes）。')
         if redact(record['summary'] + record['content']) != record['summary'] + record['content']:
             raise ValueError('资料不保存API密钥或访问令牌，请先移除密钥')
+        if old and kb.material_fingerprint(old) != kb.material_fingerprint(record):
+            previous = old.get('verification') or {}
+            if previous.get('status') in ('pending', 'reviewed', 'invalidated'):
+                record['verification'] = {**previous, 'status': 'invalidated', 'invalidated_at': kb.now(),
+                    'reason': '资料内容、版本或来源已改变，请重新核验',
+                    'previous_evidence_ids': old.get('related_evidence_ids', [])}
+            if old.get('content') != record.get('content') or old.get('attachment', {}).get('sha256') != record.get('attachment', {}).get('sha256'):
+                record.update(status='unknown', checked_date=None, review_after=None, related_evidence_ids=[])
         for field in ('published_date', 'effective_date', 'checked_date', 'review_after'):
             value = record.get(field) or None
             if value:
@@ -116,9 +127,8 @@ class Knowledge:
             raise ValueError('关联证据不存在于当前行业')
         record['created_at'] = old.get('created_at') or kb.now()
         record['updated_at'] = kb.now()
-        if attachment is not None:
-            record['attachment'] = attachment
-            record['extraction'] = extraction
+        if verification is not None:
+            record['verification'] = verification
         if validate_only:
             return self.display(record)
         if old:
@@ -135,6 +145,13 @@ class Knowledge:
             result['status_label'] = '实施日期已到，需重新核对'
             result['review_due'] = True
         result['has_attachment'] = bool(record.get('attachment'))
+        verification = record.get('verification') or {}
+        verification_status = verification.get('status', 'unverified')
+        if verification.get('fingerprint') and verification['fingerprint'] != kb.material_fingerprint(record):
+            verification_status = 'invalidated'
+        result['verification_status'] = verification_status
+        result['verification_label'] = {'unverified': '尚未核验', 'pending': '待确认核验结果',
+            'reviewed': '核验已通过', 'invalidated': '资料已变更，需重新核验'}.get(verification_status, '尚未核验')
         return result
 
     def list(self, industry, query='', kind='', model_only=False):
@@ -162,51 +179,9 @@ class Knowledge:
                     records.append(self.display(record))
         return sorted(records, key=lambda r: r['updated_at'], reverse=True)
 
-    def search(self, industry, query, limit=8):
-        records = self.list(industry, query, model_only=True)
-        result = []
-        for record in records[:limit]:
-            if record.get('extraction', {}).get('text_index'):
-                candidates=[]
-                terms=[normalized(t) for t in query.split()]
-                for index, part in self.index_parts(record):
-                    score=sum(normalized(part['text']).count(term) for term in terms)
-                    candidates.append((score,index,part))
-                candidates.sort(key=lambda v:(-v[0],v[1]))
-                snippets=[]
-                for score,index,part in candidates[:3]:
-                    body=part['text']
-                    # Retain the paragraph/table marker closest to a literal match.
-                    hits=[]
-                    for term in terms:
-                        match=re.search(r'[\s—–-]*'.join(re.escape(c) for c in term),body,re.I)
-                        if match:
-                            hits.append(match.start())
-                    position=min((p for p in hits if p>=0),default=0)
-                    start=max(0,position-180)
-                    marker=body.rfind('【',0,position+1)
-                    if marker>=0 and position-marker<500:
-                        start=marker
-                    excerpt=body[start:start+1200]
-                    snippets.append({'citation':f"{record['id']}#block-{index+1}-chars-{start+1}-{start+len(excerpt)}",
-                        'location':part['first_location']+' 至 '+part['last_location'],'text':excerpt})
-                result.append({k:record.get(k) for k in ('id','industry_id','title','kind_label','region','issuer','number',
-                    'version','status_label','published_date','effective_date','checked_date','review_due','url',
-                    'related_evidence_ids','notes')} | {'snippets':snippets,'citation_kind':'local-material'})
-                continue
-            body = record.get('content') or record.get('summary', '')
-            parts = []
-            for offset in range(0, len(body), 900):
-                part = body[offset:offset + 1200]
-                score = sum(part.casefold().count(t) for t in query.casefold().split())
-                parts.append((score, offset, part))
-            parts.sort(reverse=True)
-            snippets = [{'citation': f"{record['id']}#chars-{offset + 1}-{offset + len(text)}", 'text': text}
-                        for _, offset, text in parts[:3]]
-            result.append({k: record.get(k) for k in ('id', 'industry_id', 'title', 'kind_label', 'region', 'issuer',
-                'number', 'version', 'status_label', 'published_date', 'effective_date', 'checked_date', 'review_due',
-                'url', 'related_evidence_ids', 'notes')} | {'snippets': snippets, 'citation_kind': 'local-material'})
-        return result
+    def search(self, industry, query, limit=8, fuzzy=False):
+        from .material_index import MaterialIndex
+        return MaterialIndex(self.store).search(industry, query, limit, fuzzy=fuzzy)
 
     def index_parts(self, record):
         relative=record.get('extraction',{}).get('text_index')

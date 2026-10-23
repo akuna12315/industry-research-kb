@@ -56,16 +56,38 @@ class Store:
                             and ws.scope(ws.profile_path(self.root, e)).get('specialty') == 'forestry']
         return entries
 
-    def evidence(self, industry='all', query='', include_shared=False, **filters):
+    def evidence_model_allowed(self, record, industry='all'):
+        source = record.get('material_source') if record.get('source_kind') == 'local_material' else record.get('related_material')
+        if record.get('source_kind') != 'local_material' and record.get('related_material') is None:
+            return True
+        if not isinstance(source, dict):
+            return False
+        try:
+            path = self.home(source['industry_id']) / 'materials' / (ws.safe_id(source['material_id']) + '.json')
+            material = kb.read_json(path)
+        except (KeyError, ValueError, OSError):
+            return False
+        return (bool(material.get('model_allowed')) and material.get('sensitivity') != 'restricted'
+                and (industry == 'all' or record['industry_id'] == industry or material.get('sensitivity') == 'public')
+                and kb.material_source_current(material, source))
+
+    def evidence(self, industry='all', query='', include_shared=False, model_only=False, **filters):
         entries = self.research_entries(industry, include_shared)
         args = self.args(**filters)
+        requested_limit = args.limit
+        if model_only:
+            args.limit = 10**9
         if query.strip():
             args.query = query.strip()
             hits = ws.find(self.root, entries, args, evidence_only=True)
             by_id = {(r['industry_id'], r['id']): r for e in entries for r in ws.records(self.root, e)}
-            return [by_id[(h['industry_id'], h['id'])] for h in hits if h.get('id')]
-        return sorted([r for e in entries for r in ws.records(self.root, e) if ws.matches(r, args)],
-                      key=lambda r: (r['checked_date'], r['id']), reverse=True)[:args.limit]
+            result = [by_id[(h['industry_id'], h['id'])] for h in hits if h.get('id')]
+        else:
+            result = sorted([r for e in entries for r in ws.records(self.root, e) if ws.matches(r, args)],
+                            key=lambda r: (r['checked_date'], r['id']), reverse=True)
+        if model_only:
+            result = [r for r in result if self.evidence_model_allowed(r, industry)]
+        return result[:requested_limit]
 
     def sources(self, industry):
         return ws.source_command(self.root, self.entry(industry), argparse.Namespace(action='list'))
@@ -122,6 +144,9 @@ class Store:
         return updated
 
     def import_evidence(self, industry, payload):
+        records = payload if isinstance(payload, list) else [payload]
+        if any(isinstance(r, dict) and r.get('source_kind') == 'local_material' for r in records):
+            raise ValueError('本地资料证据请从资料核验入口审阅并确认入库')
         home = self.home(industry)
         if home == self.root:
             return kb.import_records(home, payload)

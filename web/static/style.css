@@ -294,11 +294,19 @@ button.recent-row:hover,.recent-row[role=button]:hover{background:#f7f9f0}
 .message{margin-bottom:22px}
 .message-label{font-size:11px;color:#95a781;gap:7px;margin-bottom:7px}
 .message-content,.answer-markdown{font-size:14px;line-height:1.95;color:#698159}
+.answer-markdown{white-space:normal;min-width:0;max-width:100%}
 .message.user .message-content{background:#edf3e4;padding:11px 13px;border-radius:8px}
 .answer-markdown h1,.answer-markdown h2,.answer-markdown h3{font-size:15px;line-height:1.8;color:#4c713f;margin:18px 0 8px}
-.answer-markdown pre{font-size:12px;background:#edf2e6;padding:10px;max-width:100%}
-.answer-markdown table{display:block;max-width:100%;overflow:auto;border-collapse:collapse;font-size:12px}
-.answer-markdown th,.answer-markdown td{border:1px solid #dce5d0;padding:6px 8px;vertical-align:top}
+.answer-markdown pre{font-size:12px;background:#edf2e6;padding:10px;max-width:100%;white-space:pre;overflow-x:auto}
+.markdown-table-wrap{width:100%;max-width:100%;min-width:0;overflow-x:auto;overscroll-behavior-x:contain;margin:14px 0;border:1px solid #dce5d0;border-radius:6px}
+.markdown-table-wrap:focus-visible{outline:2px solid #7c9f5c;outline-offset:3px}
+.answer-markdown .markdown-table{display:table;width:max-content;min-width:100%;border-collapse:collapse;font-size:13px;line-height:1.75}
+.markdown-table th,.markdown-table td{min-width:7rem;max-width:28rem;border:1px solid #dce5d0;padding:9px 12px;vertical-align:top;white-space:normal;overflow-wrap:anywhere}
+.markdown-table th{font-weight:600;background:#edf3e4;color:#4c713f}
+.markdown-table tbody tr:nth-child(even){background:#f7faf3}
+.markdown-table .align-left{text-align:left}
+.markdown-table .align-center{text-align:center}
+.markdown-table .align-right{text-align:right}
 .tool-event{font-size:11px;padding:6px 9px;background:#f0f5e7;border-color:#c6d9b5;color:#8fa97b;line-height:1.8}
 .citation{font-size:11px;border-color:#dfe8d2;padding:9px 10px;border-radius:6px;color:#7f9c68;line-height:1.8;overflow-wrap:anywhere;background:#fcfdf8}
 .citation small{font-size:10px;color:#a4b290}
@@ -762,6 +770,31 @@ body[data-current-view=research]:has(.research-workspace.tools-open) .research-h
 #research-tools-drawer>.library-switch{margin-bottom:20px;gap:25px}
 #research-tools-drawer #research-tool-content{min-height:0;padding-bottom:14px}
 #research-tools-drawer .evidence-list{display:flex}
+.verification-toolbar,.material-review-actions,.verification-badges{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.verification-toolbar{padding:12px 0;margin-bottom:8px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);font-size:12px;color:var(--muted)}
+.verification-toolbar label,.material-selection{display:flex;align-items:center;gap:7px}
+.verification-toolbar input,.material-selection input{width:15px;height:15px;accent-color:var(--green);flex-shrink:0}
+.material-selection{font-size:12px;color:var(--muted)}
+.material-review-actions{margin-top:13px;padding-top:10px;border-top:1px solid var(--line)}
+.verification-review{padding:12px 0;border-bottom:1px solid var(--line)}
+.verification-review:first-child{padding-top:0}
+.verification-review h3{font-size:16px;line-height:1.6;margin:0 0 8px}
+.verification-review .notice{display:block;line-height:1.8;margin:12px 0;overflow-wrap:anywhere}
+.verification-review .description,.verification-origin p,.verification-findings p{overflow-wrap:anywhere}
+.verification-errors{font-size:12px;line-height:1.8;padding:12px;border:1px solid #dab5ac;background:#fff7f3;border-radius:6px;overflow-wrap:anywhere}
+.verification-errors p{margin:6px 0}
+.verification-origin{padding:14px;background:#f7faf7;border:1px solid var(--line);border-radius:7px;margin:16px 0;white-space:pre-wrap;overflow-wrap:anywhere}
+.verification-origin .secondary{margin:6px 6px 0 0}
+.verification-findings{font-size:12px;line-height:1.7;padding:3px 0}
+.verification-findings p{margin:5px 0}
+.verification-required{display:block;text-align:left;padding:12px}
+.verification-required p{margin:8px 0}
+.verification-required .material-review-actions{margin-top:8px;padding-top:8px}
+.verification-queue .report-row{padding:12px;align-items:flex-start;font-size:13px}
+.verification-queue label{overflow-wrap:anywhere}
+#verification-results{white-space:pre-wrap;font-size:13px;line-height:1.9;overflow-wrap:anywhere;margin-top:14px}
+#verification-decision-form>.dialog-actions{position:sticky;bottom:-24px;background:#fff;padding:12px 0 3px;flex-wrap:wrap;border-top:1px solid var(--line)}
+@media(max-width:600px){.verification-toolbar{align-items:flex-start}.verification-badges{justify-content:flex-start}.verification-review .form-grid{display:block}.material-selection{align-items:flex-start}.verification-queue .report-row{gap:6px;flex-wrap:wrap}}
 #research-tools-drawer .form-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
 @keyframes research-drawer-in{from{opacity:.75;transform:translateX(14px)}to{opacity:1;transform:translateX(0)}}
 @media(max-width:1180px) and (min-width:761px){
@@ -875,6 +908,17 @@ body[data-current-view=research] .main-footer{display:none}
 .chart-source{padding:12px 0;border-bottom:1px solid #e0e7d8}
 .chart-source h3{font-size:14px;margin:0}
 .chart-source blockquote{font-size:12px;padding:10px 12px;margin:9px 0;background:#f2f6ec;white-space:pre-wrap;overflow-wrap:anywhere;max-height:260px;overflow:auto}
+.extraction-status{margin:12px 0;padding:12px 14px;background:#f4f7ee;border:1px solid #dce5d4;border-radius:9px;overflow-wrap:anywhere}
+.extraction-summary{margin:0 0 8px;color:#486342;font-size:13px;line-height:1.8}
+.extraction-status progress{display:block;appearance:none;width:100%;height:6px;border:0;border-radius:3px;overflow:hidden;background:#e1e8d9;accent-color:#678952}
+.extraction-status progress::-webkit-progress-bar{background:#e1e8d9}
+.extraction-status progress::-webkit-progress-value{background:#678952}
+.extraction-counts{display:flex;flex-wrap:wrap;gap:5px 20px;margin-top:12px;color:#6e7e62;font-size:12px}
+.extraction-problem{margin:10px 0;color:#9a6231;font-size:12px;white-space:pre-wrap;line-height:1.7}
+.extraction-error{border-color:#e3c9a9}
+.extraction-status .material-review-actions{margin:8px 0 0;gap:16px}
+.extraction-status .description{margin:10px 0 0}
+.evidence-support{margin-top:14px;padding-top:10px;border-top:1px solid #dce5d4}
 @media(max-width:760px){
   body[data-current-view=research] .content{--research-side-padding:20px;padding-top:0;padding-bottom:12px}
 }

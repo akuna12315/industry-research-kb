@@ -8,6 +8,79 @@ let webResults=null, crawlSeeds='', crawlPoll=null, lastCrawlId=null;
 let webOptions={period:'',limit:10}, crawlOptions={max_pages:10,max_depth:'1'};
 const crawlLabels={running:'采集中',completed:'采集完成',partial:'部分失败',failed:'采集失败',cancelled:'已停止',interrupted:'服务重启中断',new:'新增候选',changed:'内容变化',unchanged:'内容未变化',duplicate:'重复内容'};
 let booted=false, refreshSeq=0, materialKind='', materialRecords=[], conversationRecords=[];
+let verificationQueue=[], verificationReviews=[], materialSelection=new Set(), verificationPreparing=false;
+const extractionJobs=new Map(),extractionLabels={queued:'等待提取',running:'正在提取',paused:'已暂停',partial:'部分批次失败',completed:'可解析内容处理完成',waiting_model:'等待模型配置',waiting_permission:'等待资料模型授权',invalidated:'资料已变化，任务已停止'};
+let extractionPoll=null,extractionPolling=false;
+const extractionKey=j=>JSON.stringify([j.industry_id,j.id]);
+const extractionActive=j=>['queued','running'].includes(j?.status);
+const extractionNumber=value=>Number.isFinite(Number(value))?Math.max(0,Number(value)):0;
+const verificationLabels={unverified:'尚未核验',pending:'待审核',reviewed:'核验已通过',approved:'核验已通过',rejected:'核验未通过',invalidated:'资料已变化，需重新核验'};
+const materialKey=r=>JSON.stringify([r.industry_id,r.id||r.material_id]);
+const verificationState=r=>r.verification_status||r.verification?.status||'unverified';
+const materialValidity=r=>r.status==='unknown'?'有效性待确认':r.status_label;
+const materialApproved=r=>['reviewed','approved'].includes(verificationState(r));
+function materialVerificationText(r){
+  const state=verificationState(r);if(!materialApproved(r))return verificationLabels[state]||'尚未核验';
+  if(r.extraction_job?.mode==='hard_chunk_index')return '已通过 · '+(r.extraction_job.status==='completed'?'全文已索引':'索引需重建');
+  if(r.extraction_job)return '已通过 · '+(extractionLabels[r.extraction_job.status]||'全文提取待处理');
+  return r.verification?.extraction_status==='failed'?'已通过 · 证据提取失败':r.verification?.extraction_status==='pending'?'已通过 · 尚无全文提取任务':verificationLabels[state]||'核验已通过';
+}
+function verificationBadge(r){const warning=!materialApproved(r)||['partial','waiting_model','waiting_permission','invalidated'].includes(r.extraction_job?.status)||r.verification?.extraction_status==='failed';return badge(warning?'needs_verification':'current',materialVerificationText(r));}
+function materialVerificationAction(r,detail=false){
+  const style=detail?'secondary':'link-button';
+  if(materialApproved(r))return `<button class="${style}" data-action="restart-material-extraction" data-id="${esc(r.id)}" data-industry="${esc(r.industry_id)}" ${extractionActive(r.extraction_job)?'disabled':''}>重建全文索引</button>`;
+  return `<button class="${style}" ${detail?'id="verify-material-manual"':`data-action="verify-material-manual" data-id="${esc(r.id)}" data-industry="${esc(r.industry_id)}"`}>通过核验</button>`;
+}
+
+function extractionSummary(job){
+  if(job.mode==='hard_chunk_index')return job.status==='completed'?`全文已索引 · ${extractionNumber(job.indexed_chunks)} 个固定分块 · ${extractionNumber(job.source_characters).toLocaleString()} 个原文字符 · 原文可检索`:'原文版本已变化，请重建全文索引';
+  const p=job.progress||{},done=extractionNumber(p.completed),total=extractionNumber(p.total),failed=extractionNumber(p.failed),images=extractionNumber(p.unprocessed_images),blankTables=extractionNumber(p.tables_without_text??p.table_without_text??job.tables_without_text??job.table_without_text),tables=extractionNumber(p.total_tables),processedTables=extractionNumber(p.processed_tables);
+  if(job.status==='completed'){
+    const textDone=processedTables<Math.max(0,tables-blankTables)?`全文文字处理完成；表格已处理 ${processedTables} / ${tables}（尚有表格未处理）`:blankTables?'全文可解析文字及原生文字表格处理完成':'全文文字及表格处理完成';
+    return `${textDone}${blankTables?`；无原生文字表格 ${blankTables} 个未识别`:''}；${images?`图片 ${images} 张未处理`:'图片处理范围见覆盖说明'}。已入库 ${extractionNumber(p.evidence_count)} 条证据`;
+  }
+  return `${extractionLabels[job.status]||'待处理'} · 已处理 ${done} / ${total} 批${failed?` · 失败 ${failed} 批`:''} · 已入库 ${extractionNumber(p.evidence_count)} 条`;
+}
+function extractionMarkup(job,detailed=false){
+  if(job.mode==='hard_chunk_index')return `<div class="extraction-status" role="status"><p class="extraction-summary">${esc(extractionSummary(job))}</p>${detailed?`<p class="description">按 ${extractionNumber(job.chunk_size)} 字符硬切分，相邻重叠 ${extractionNumber(job.overlap)} 字符，保留原文逐字引用位置。原生表格 ${extractionNumber(job.progress?.total_tables)} 个；未识别媒体 ${extractionNumber(job.progress?.unprocessed_images)} 个。</p><p class="description">${esc(job.coverage_note)}</p><p class="description">导入和建索引不调用模型。提问后先召回片段，再由模型重排与分析；已有事实证据保留。</p>`:`<button class="link-button" data-action="view-extraction" data-industry="${esc(job.industry_id)}" data-id="${esc(job.id)}">查看索引详情</button>`}</div>`;
+  const p=job.progress||{},total=extractionNumber(p.total),done=extractionNumber(p.completed),characters=extractionNumber(p.total_characters),percent=Math.min(100,Math.floor(characters?extractionNumber(p.processed_characters)/characters*100:total?done/total*100:0));
+  const identity=`data-industry="${esc(job.industry_id)}" data-id="${esc(job.id)}"`,controls=[];
+  if(extractionActive(job))controls.push(`<button class="link-button" data-action="control-extraction" data-control="pause" ${identity}>暂停</button>`);
+  if(['paused','waiting_model','waiting_permission'].includes(job.status))controls.push(`<button class="link-button" data-action="control-extraction" data-control="resume" ${identity}>继续提取</button>`);
+  if(job.status==='partial')controls.push(`<button class="link-button" data-action="control-extraction" data-control="retry" ${identity}>重试失败批次</button>`);
+  if(!detailed)controls.push(`<button class="link-button" data-action="view-extraction" ${identity}>查看提取详情</button>`);
+  const batches=Array.isArray(job.batches)?job.batches:[],batchList=detailed&&batches.length?`<details class="extraction-batches"><summary>批次处理清单 (${batches.length})</summary>${batches.slice(0,100).map((batch,index)=>`<p><strong>批次 ${extractionNumber(batch.index??(index+1))}</strong> · ${esc(({pending:'待处理',running:'正在处理',completed:'已处理',no_evidence:'已处理，未发现可提取证据',failed:'失败',queued:'等待处理'})[batch.status]||batch.status||'待处理')}${batch.error?`<br><span class="extraction-problem">${esc(batch.error)}</span>`:''}</p>`).join('')}${batches.length>100?`<p class="description">显示前 100 批，任务总进度涵盖全部 ${batches.length} 批。</p>`:''}</details>`:'';
+  return `<div class="extraction-status ${job.status==='partial'?'extraction-error':''}" role="status"><p class="extraction-summary">${esc(extractionSummary(job))}</p><progress max="100" value="${percent}" aria-label="全文证据提取进度 ${percent}%"></progress>${detailed?`<div class="extraction-counts"><span>字符 ${extractionNumber(p.processed_characters).toLocaleString()} / ${extractionNumber(p.total_characters).toLocaleString()}</span><span>表格 ${extractionNumber(p.processed_tables)} / ${extractionNumber(p.total_tables)}</span><span>未处理图片 ${extractionNumber(p.unprocessed_images)}</span>${extractionNumber(p.tables_without_text??p.table_without_text)?`<span>无原生文字表格 ${extractionNumber(p.tables_without_text??p.table_without_text)} 个未识别</span>`:''}</div>`:''}${job.status==='waiting_model'?'<p class="description">请在设置中配置模型密钥，然后继续提取。资料已通过，尚未完成全文证据提取。</p>':''}${job.status==='waiting_permission'?'<p class="description">请在资料编辑中允许模型使用片段，然后继续提取。当前不会把资料发送给模型。</p>':''}${job.error?`<p class="extraction-problem">${esc(job.error)}</p>`:''}${detailed?`<p class="description">${esc(job.coverage_note||job.scope_note||'处理范围为可解析文字与表格；图片尚未识别，不代表外部事实已核实。')}</p><p class="description">任务在本机后台运行，关闭页面后仍会继续；服务重启后可继续未完成批次。</p>`:''}${batchList}<div class="material-review-actions">${controls.join('')}</div></div>`;
+}
+function historicalExtraction(job){return {...job,status:'invalidated',coverage_note:'当前资料尚未通过有效版本核验。以下进度属于历史提取任务，不能代表当前资料已经完成证据提取。'};}
+function extractionHost(job,detailed=false,stale=false){if(!job)return '';extractionJobs.set(extractionKey(job),job);return `<div data-extraction-id="${esc(job.id)}" data-extraction-industry="${esc(job.industry_id)}" data-extraction-detail="${detailed?'true':'false'}" data-extraction-stale="${stale?'true':'false'}">${extractionMarkup(stale?historicalExtraction(job):job,detailed)}</div>`;}
+function materialExtractionHost(record,detailed=false){return extractionHost(record.extraction_job,detailed,record.extraction_job?.mode!=='hard_chunk_index'&&!materialApproved(record));}
+function updateExtractionHosts(job){
+  extractionJobs.set(extractionKey(job),job);
+  for(const r of materialRecords)if(r.industry_id===job.industry_id&&r.id===job.material_id&&(!r.extraction_job||r.extraction_job.id===job.id))r.extraction_job=job;
+  document.querySelectorAll('[data-extraction-id]').forEach(host=>{if(host.dataset.extractionId!==job.id||host.dataset.extractionIndustry!==job.industry_id)return;const batchesOpen=host.querySelector('.extraction-batches')?.open;host.innerHTML=extractionMarkup(host.dataset.extractionStale==='true'?historicalExtraction(job):job,host.dataset.extractionDetail==='true');if(batchesOpen&&host.querySelector('.extraction-batches'))host.querySelector('.extraction-batches').open=true;const card=host.closest('.evidence-card');if(card){const badge=card.querySelector('.verification-badges')?.children[0];if(badge){const record=materialRecords.find(r=>r.id===job.material_id&&r.industry_id===job.industry_id);badge.textContent=record?materialVerificationText(record):'提取任务 · '+(extractionLabels[job.status]||'待处理');}}});
+  document.querySelectorAll('[data-action="restart-material-extraction"]').forEach(button=>{if(button.dataset.id===job.material_id&&button.dataset.industry===job.industry_id)button.disabled=extractionActive(job);});
+}
+function visibleActiveExtractions(){
+  const unique=new Map();document.querySelectorAll('[data-extraction-id]').forEach(host=>{if(host.dataset.extractionStale==='true'||host.closest('#agent-parking')||host.closest('#dialog')&&!$('#dialog').open)return;const key=JSON.stringify([host.dataset.extractionIndustry,host.dataset.extractionId]),job=extractionJobs.get(key);if(extractionActive(job))unique.set(key,job);});return [...unique.values()];
+}
+function scheduleExtractionPoll(){clearTimeout(extractionPoll);extractionPoll=null;if(!extractionPolling&&visibleActiveExtractions().length)extractionPoll=setTimeout(pollExtractions,3000);}
+async function pollExtractions(){
+  extractionPoll=null;if(extractionPolling)return;const jobs=visibleActiveExtractions();if(!jobs.length)return;extractionPolling=true;
+  try{const results=await Promise.allSettled(jobs.map(j=>api('/extractions/'+encodeURIComponent(j.industry_id)+'/'+encodeURIComponent(j.id))));results.forEach(result=>{if(result.status==='fulfilled')updateExtractionHosts(result.value.job||result.value);});}
+  finally{extractionPolling=false;scheduleExtractionPoll();}
+}
+function showExtractionJob(job){const record=materialRecords.find(r=>r.id===job.material_id&&r.industry_id===job.industry_id),stale=record&&job.mode!=='hard_chunk_index'&&!materialApproved(record);dialog((stale?'历史提取任务 · ':'')+(job.title||'全文证据提取'),`<div class="extraction-detail">${extractionHost(job,true,stale)}<div class="dialog-actions"><button class="secondary" data-action="view-material" data-industry="${esc(job.industry_id)}" data-id="${esc(job.material_id)}">查看资料</button><button class="secondary" data-action="refresh-extraction" data-industry="${esc(job.industry_id)}" data-id="${esc(job.id)}">刷新状态</button></div></div>`);scheduleExtractionPoll();}
+async function openExtraction(industry,id){const result=await api('/extractions/'+encodeURIComponent(industry)+'/'+encodeURIComponent(id));showExtractionJob(result.job||result);}
+async function startMaterialExtraction(industry,id,button){
+  if(button.disabled)return;button.disabled=true;const previousBody=$('#dialog-body').innerHTML,previousOpen=$('#dialog').open;
+  try{const result=await api('/materials/'+encodeURIComponent(industry)+'/'+encodeURIComponent(id)+'/extractions','POST',{restart:true}),job=result.job||result;for(const r of materialRecords)if(r.id===id&&r.industry_id===industry)r.extraction_job=job;updateExtractionHosts(job);if(S.view==='materials')await render();if($('#dialog-body').innerHTML===previousBody&&$('#dialog').open===previousOpen)showExtractionJob(job);toast(job.mode==='hard_chunk_index'?'全文索引已建立，可以检索':job.status==='waiting_model'?'资料已通过，等待配置模型后提取':'全文证据提取任务已创建');}
+  finally{if(button.isConnected)button.disabled=false;scheduleExtractionPoll();}
+}
+async function controlExtraction(industry,id,action,button){
+  if(button.disabled)return;button.disabled=true;try{const result=await api('/extractions/'+encodeURIComponent(industry)+'/'+encodeURIComponent(id)+'/control','POST',{action});updateExtractionHosts(result.job||result);}
+  finally{if(button.isConnected)button.disabled=false;scheduleExtractionPoll();}
+}
 
 async function api(path, method='GET', data){
   const response = await fetch('/api'+path,{method,headers:{'Content-Type':'application/json','X-KB-Request':'1'},body:data===undefined?undefined:JSON.stringify(data)});
@@ -25,13 +98,87 @@ function badge(state,label){return `<span class="badge ${['review_due','needs_ve
 function heading(title,subtitle,buttons=''){return `<div class="page-heading"><div><h1>${title}</h1><p>${subtitle}</p></div><div class="actions">${buttons}</div></div>`;}
 function updateModelLabel(config){$('#model-name').textContent=(config.key_configured?'':'待配置密钥 · ')+config.display_name+' / '+config.model;$('#model-name').setAttribute('title',config.key_configured?'密钥已配置，实际连接以模型调用结果为准。':'请在模型与助手设置中填写API密钥，密钥仅保存在服务端内存。');}
 function empty(title,text,button=''){return `<div class="empty"><div class="empty-icon">◫</div><strong>${title}</strong><p>${text}</p>${button}</div>`;}
-function dialog(title,html){$('#dialog-title').textContent=title;$('#dialog-body').innerHTML=html;if(!$('#dialog').open)$('#dialog').showModal();}
+function dialog(title,html){$('#dialog-title').textContent=title;$('#dialog-body').innerHTML=html;if(!$('#dialog').open)$('#dialog').showModal();scheduleExtractionPoll();}
 function split(value){return value.split(/[，,\n]/).map(x=>x.trim()).filter(Boolean);}
+function markdownCodeEnd(text,start,size){
+  for(let i=text.indexOf('`',start+size);i>=0;i=text.indexOf('`',i)){
+    let end=i;while(text[end]==='`')++end;
+    if(end-i===size)return i;i=end;
+  }
+  return -1;
+}
+function markdownInline(raw){
+  const markup=[],protect=html=>'\0'+(markup.push(html)-1)+'\0';
+  const input=String(raw).replaceAll('\0','');let plain='';
+  for(let i=0;i<input.length;){
+    if(input[i]==='`'){
+      let end=i;while(input[end]==='`')++end;
+      const close=markdownCodeEnd(input,i,end-i);
+      if(close>=0){plain+=protect('<code>'+esc(input.slice(end,close))+'</code>');i=close+end-i;continue;}
+    }
+    plain+=input[i++];
+  }
+  plain=plain.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g,(match,label,url)=>{
+    if(url.includes('\0'))return match;
+    return protect(`<a href="${esc(safeURL(url))}" target="_blank" rel="noopener noreferrer">${esc(label).replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>')}</a>`);
+  });
+  let html=esc(plain).replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>');
+  // A link label may contain a protected code span; source NULs cannot forge tokens.
+  for(let pass=0;pass<2;++pass)html=html.replace(/\0(\d+)\0/g,(_,n)=>markup[Number(n)]||'');
+  return html;
+}
+function markdownTableCells(raw){
+  const line=raw.trim(),cells=[];let cell='',hasPipe=false,lastPipe=-1;
+  for(let i=0;i<line.length;){
+    if(line[i]==='\\'){
+      let end=i;while(line[end]==='\\')++end;
+      if(line[end]==='|'){
+        cell+='\\'.repeat(Math.floor((end-i)/2));
+        if((end-i)%2){cell+='|';i=end+1;continue;}
+        i=end;continue;
+      }
+      cell+=line.slice(i,end);i=end;continue;
+    }
+    if(line[i]==='`'){
+      let end=i;while(line[end]==='`')++end;
+      const close=markdownCodeEnd(line,i,end-i);
+      if(close>=0){const finish=close+end-i;cell+=line.slice(i,finish).replace(/\\\|/g,'|');i=finish;continue;}
+    }
+    if(line[i]==='|'){hasPipe=true;lastPipe=i;cells.push(cell.trim());cell='';++i;}
+    else cell+=line[i++];
+  }
+  if(!hasPipe)return null;
+  cells.push(cell.trim());if(line[0]==='|')cells.shift();if(lastPipe===line.length-1)cells.pop();
+  return cells;
+}
 function markdown(raw){
-  let text=esc(raw);
-  text=text.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,(_,label,url)=>`<a href="${esc(safeURL(url.replaceAll('&amp;','&')))}" target="_blank" rel="noopener noreferrer">${label}</a>`);
-  text=text.replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>').replace(/`([^`\n]+)`/g,'<code>$1</code>');
-  return text.split('\n').map(line=>/^#{1,3} /.test(line)?`<h3>${line.replace(/^#+ /,'')}</h3>`:/^[-*] /.test(line)?`<div>• ${line.slice(2)}</div>`:`<div>${line||'<br>'}</div>`).join('');
+  const lines=String(raw??'').replace(/\r\n?/g,'\n').split('\n'),blocks=[];
+  for(let i=0;i<lines.length;){
+    const fence=/^\s{0,3}(`{3,}|~{3,})[^\n]*$/.exec(lines[i]);
+    if(fence){
+      const marker=fence[1],body=[];let end=i+1;
+      for(;end<lines.length;++end){
+        const close=/^\s{0,3}(`+|~+)\s*$/.exec(lines[end]);
+        if(close&&close[1][0]===marker[0]&&close[1].length>=marker.length)break;
+        body.push(lines[end]);
+      }
+      blocks.push('<pre><code>'+esc(body.join('\n'))+'</code></pre>');i=end<lines.length?end+1:end;continue;
+    }
+    const header=markdownTableCells(lines[i]),divider=i+1<lines.length?markdownTableCells(lines[i+1]):null;
+    if(header?.length&&divider?.length===header.length&&divider.every(cell=>/^:?-+:?$/.test(cell))){
+      const align=divider.map(cell=>cell.startsWith(':')&&cell.endsWith(':')?'center':cell.endsWith(':')?'right':'left');
+      const row=(cells,tag)=>'<tr>'+header.map((_,n)=>`<${tag}${tag==='th'?' scope="col"':''} class="align-${align[n]}">${markdownInline(cells[n]||'')}</${tag}>`).join('')+'</tr>';
+      const body=[];i+=2;
+      while(i<lines.length){
+        if(!lines[i].trim()||/^\s{0,3}(?:`{3,}|~{3,})/.test(lines[i]))break;
+        const cells=markdownTableCells(lines[i]);if(!cells)break;body.push(row(cells,'td'));++i;
+      }
+      blocks.push('<div class="markdown-table-wrap" role="region" aria-label="表格" tabindex="0"><table class="markdown-table"><thead>'+row(header,'th')+'</thead><tbody>'+body.join('')+'</tbody></table></div>');continue;
+    }
+    const line=lines[i++],html=markdownInline(line);
+    blocks.push(/^#{1,3} /.test(line)?`<h3>${markdownInline(line.replace(/^#+ /,''))}</h3>`:/^[-*] /.test(line)?`<div>• ${markdownInline(line.slice(2))}</div>`:`<div>${html||'<br>'}</div>`);
+  }
+  return blocks.join('');
 }
 async function refresh(){
   const request=++refreshSeq, data=await api('/state');
@@ -50,7 +197,7 @@ async function render(){
   if(S.view==='timeline')S.view='research';
   ++S.renderSeq;
   ++S.toolSeq;
-  clearTimeout(crawlPoll);
+  clearTimeout(crawlPoll);clearTimeout(extractionPoll);extractionPoll=null;
   // Keep the one live Agent tree (and its listeners/stream targets) across pages.
   $('#agent-parking').append($('#agent-panel'));
   document.body.dataset.currentView=S.view;
@@ -127,16 +274,19 @@ async function renderResearchTool(){
 async function renderMaterials(){
   const ticket=S.renderSeq;
   const industry=S.industry;
-  const records=await api('/materials?'+new URLSearchParams({industry,q:S.q,kind:materialKind}));
+  const [pending,records]=await Promise.all([api('/verifications?'+new URLSearchParams({industry,status:'pending'})),api('/materials?'+new URLSearchParams({industry,q:S.q,kind:materialKind}))]);
   if(ticket!==S.renderSeq||S.view!=='materials'||S.industry!==industry)return;
-  materialRecords=records;
+  materialRecords=records;records.forEach(r=>{if(r.extraction_job)extractionJobs.set(extractionKey(r.extraction_job),r.extraction_job);});
+  verificationQueue=Array.isArray(pending)?pending:pending.items||[];
+  materialSelection=new Set([...materialSelection].filter(key=>records.some(r=>materialKey(r)===key)));
   $('#content').innerHTML=libraryHeader()+librarySearch()+
-    `<div class="filter-row"><select id="material-kind" aria-label="资料类型">${options([['','全部资料'],...Object.entries(S.data.material_kinds)],materialKind)}</select><span class="description">${records.length}份 · 仅勾选“允许模型引用”的资料进入Agent检索</span></div><div class="evidence-list">${records.map(r=>`<article class="evidence-card"><div class="card-top"><div class="category">${esc(r.kind_label)} / ${esc(r.region||'地域待填')}</div>${badge(r.status==='unknown'?'needs_verification':r.status==='obsolete'?'superseded':r.status==='upcoming'?'planned':'current',r.status_label)}${r.review_due?badge('review_due','待复核'):''}</div><h3><button class="link-button material-title" data-action="view-material" data-id="${esc(r.id)}" data-industry="${esc(r.industry_id)}">${esc(r.title)}</button></h3><p class="summary">${esc(r.summary||'暂无摘要，可登记资料说明或上传文字版文档。')}</p><div class="card-foot"><span>${esc(r.number||r.issuer||'来源待填')} · ${r.has_attachment?'已有附件':'目录/文字条目'} · ${esc(industryName(r.industry_id))}</span><span class="tag">${r.model_allowed?'可供模型引用':'仅本地管理'}</span></div></article>`).join('')||empty('当前分类没有资料','先登记目录，或上传已有文件。缺失的项目与空间数据保留为待补充项。')}</div>`;
+    `<div class="filter-row"><select id="material-kind" aria-label="资料类型">${options([['','全部资料'],...Object.entries(S.data.material_kinds)],materialKind)}</select><span class="description">${records.length}份 · 资料核验与有效性分别管理</span></div><div class="verification-toolbar"><label><input id="material-select-all" type="checkbox" ${records.length&&records.every(r=>materialSelection.has(materialKey(r)))?'checked':''}> 全选本页</label><span id="material-selection-count">已选 ${materialSelection.size} 份 / 最多10份</span><button class="secondary" data-action="verify-selected-manual">批量通过核验</button><button class="secondary" data-action="verify-selected-automatic">批量自动核验</button><button class="secondary" data-action="verification-queue">待核验资料（${verificationQueue.length}）</button></div><p class="description">确认资料后点击“通过核验”，系统自动建立全文检索索引；也可先用自动核验检查资料。</p><div class="evidence-list">${records.map(r=>`<article class="evidence-card"><div class="card-top"><label class="material-selection"><input name="material-pick" type="checkbox" value="${esc(materialKey(r))}" ${materialSelection.has(materialKey(r))?'checked':''} aria-label="选择 ${esc(r.title)}"> ${esc(r.kind_label)} / ${esc(r.region||'地域待填')}</label><div class="verification-badges">${verificationBadge(r)}${r.status&&r.status!=='unknown'?badge(r.status==='obsolete'?'superseded':'current',materialValidity(r)):''}${r.review_due?badge('review_due','待复核'):''}</div></div><h3><button class="link-button material-title" data-action="view-material" data-id="${esc(r.id)}" data-industry="${esc(r.industry_id)}">${esc(r.title)}</button></h3><p class="summary">${esc(r.summary||'暂无摘要，可登记资料说明或上传文字版文档。')}</p><div class="card-foot"><span>${esc(r.number||r.issuer||'来源待填')} · ${r.has_attachment?'已有附件':'目录/文字条目'} · ${esc(industryName(r.industry_id))}</span><span class="tag">${r.model_allowed?'可供模型引用':'仅本地管理'}</span></div>${materialExtractionHost(r)}<div class="material-review-actions">${materialVerificationAction(r)}<button class="link-button" data-action="verify-material-automatic" data-id="${esc(r.id)}" data-industry="${esc(r.industry_id)}">自动核验</button></div></article>`).join('')||empty('当前分类没有资料','先登记目录，或上传已有文件。缺失的项目与空间数据保留为待补充项。')}</div>`;
+  scheduleExtractionPoll();
 }
 function materialDialog(record={}){
   const industry=record.industry_id||chooseIndustry();if(!industry){toast('请先创建或选择行业');return;}
   const region=record.region||S.data.industries.find(i=>i.id===industry)?.scope.primary_region||'';
-  dialog(record.id?(S.data.industries.find(i=>i.id===industry)?.scope.library_role==='national-foundation'?'编辑全国基础资料 · 各地区共用':'编辑专业资料'):'添加专业资料',`<form id="material-form" data-industry="${esc(industry)}" data-id="${esc(record.id||'')}"><div class="form-grid"><label class="field full">资料标题<input name="title" value="${esc(record.title)}" required maxlength="300"></label><label class="field">资料类型<select name="kind">${options(Object.entries(S.data.material_kinds),record.kind||materialKind||'policy')}</select></label><label class="field">地域<input name="region" value="${esc(region)}"></label><label class="field">发布/责任机构<input name="issuer" value="${esc(record.issuer)}"></label><label class="field">文号/标准编号<input name="number" value="${esc(record.number)}" placeholder="GB/T 15776-2023"></label><label class="field">版本<input name="version" value="${esc(record.version)}"></label><label class="field">有效性<select name="status">${options(Object.entries(S.data.material_states),record.status||'unknown')}</select></label><label class="field">发布日期<input name="published_date" type="date" value="${esc(record.published_date)}"></label><label class="field">实施日期<input name="effective_date" type="date" value="${esc(record.effective_date)}"></label><label class="field">真实核验日期<input name="checked_date" type="date" value="${esc(record.checked_date)}"></label><label class="field">下次复核日期<input name="review_after" type="date" value="${esc(record.review_after)}"></label><label class="field full">来源URL<input name="url" type="url" value="${esc(record.url)}"></label><label class="field full">简明摘要<textarea name="summary" rows="3">${esc(record.summary)}</textarea></label><label class="field full">${record.extraction?.text_index?'附件提取正文（只读）':'可检索正文/资料说明'}<textarea name="content" rows="6" ${record.extraction?.text_index?'readonly':''}>${esc(record.content)}</textarea>${record.extraction?.text_index?'<small>原文需重新上传附件更新；补充说明请填写简明摘要或适用范围与限制。</small>':''}</label><label class="field full">附件（可选）<input name="file" type="file" accept=".txt,.md,.csv,.pdf,.docx,.png,.jpg,.jpeg,.tif,.tiff,.geojson,.zip"><small>10MB以内；扫描PDF未做OCR。影像和空间附件只登记元数据，不做GIS计算。</small></label><label class="field">资料级别<select name="sensitivity">${options([['public','公开资料'],['internal','内部资料'],['restricted','受限资料（仅本地）']],record.sensitivity||'internal')}</select></label><label class="field"><span>模型引用</span><span><input name="model_allowed" type="checkbox" ${record.model_allowed?'checked':''}>允许模型使用检索片段</span><small>厂商模型会接收引用片段，受限资料不送模型。</small></label><label class="field">调查年度/时相<input name="coverage_period" value="${esc(record.coverage_period)}"></label><label class="field">项目阶段<input name="project_stage" value="${esc(record.project_stage)}" placeholder="未批复 / 已批复 / 在建 / 已验收"></label><label class="field">比例尺<input name="scale" value="${esc(record.scale)}"></label><label class="field">坐标系<input name="coordinate_system" value="${esc(record.coordinate_system)}"></label><label class="field">影像分辨率<input name="resolution" value="${esc(record.resolution)}"></label><label class="field">标签<input name="tags" value="${esc((record.tags||[]).join('，'))}"></label><label class="field full">关联证据ID<input name="related_evidence_ids" value="${esc((record.related_evidence_ids||[]).join('，'))}" placeholder="逗号分隔，须为本行业已有证据"></label><label class="field full">适用范围与限制<textarea name="notes">${esc(record.notes)}</textarea></label></div><div class="dialog-actions"><button class="primary" type="submit">保存资料</button></div></form>`);  arrangeMaterialForm();
+  dialog(record.id?(S.data.industries.find(i=>i.id===industry)?.scope.library_role==='national-foundation'?'编辑全国基础资料 · 各地区共用':'编辑专业资料'):'添加专业资料',`<form id="material-form" data-industry="${esc(industry)}" data-id="${esc(record.id||'')}"><div class="form-grid"><label class="field full">资料标题<input name="title" value="${esc(record.title)}" required maxlength="300"></label><label class="field">资料类型<select name="kind">${options(Object.entries(S.data.material_kinds),record.kind||materialKind||'policy')}</select></label><label class="field">地域<input name="region" value="${esc(region)}"></label><label class="field">发布/责任机构<input name="issuer" value="${esc(record.issuer)}"></label><label class="field">文号/标准编号<input name="number" value="${esc(record.number)}" placeholder="GB/T 15776-2023"></label><label class="field">版本<input name="version" value="${esc(record.version)}"></label><label class="field">有效性<select name="status">${options(Object.entries(S.data.material_states).map(([key,label])=>[key,key==='unknown'?'有效性待确认':label]),record.status||'unknown')}</select></label><label class="field">发布日期<input name="published_date" type="date" value="${esc(record.published_date)}"></label><label class="field">实施日期<input name="effective_date" type="date" value="${esc(record.effective_date)}"></label><label class="field">资料核对日期<input name="checked_date" type="date" value="${esc(record.checked_date)}"></label><label class="field">下次复核日期<input name="review_after" type="date" value="${esc(record.review_after)}"></label><label class="field full">来源URL<input name="url" type="url" value="${esc(record.url)}"></label><label class="field full">简明摘要<textarea name="summary" rows="3">${esc(record.summary)}</textarea></label><label class="field full">${record.extraction?.text_index?'附件提取正文（只读）':'可检索正文/资料说明'}<textarea name="content" rows="6" ${record.extraction?.text_index?'readonly':''}>${esc(record.content)}</textarea>${record.extraction?.text_index?'<small>原文需重新上传附件更新；补充说明请填写简明摘要或适用范围与限制。</small>':''}</label><label class="field full">附件（可选）<input name="file" type="file" accept=".txt,.md,.csv,.pdf,.docx,.png,.jpg,.jpeg,.tif,.tiff,.geojson,.zip"><small>10MB以内；扫描PDF未做OCR。影像和空间附件只登记元数据，不做GIS计算。</small></label><label class="field">资料级别<select name="sensitivity">${options([['public','公开资料'],['internal','内部资料'],['restricted','受限资料（仅本地）']],record.sensitivity||'internal')}</select></label><label class="field"><span>模型引用</span><span><input name="model_allowed" type="checkbox" ${record.model_allowed?'checked':''}>允许模型使用检索片段</span><small>厂商模型会接收引用片段，受限资料不送模型。</small></label><label class="field">调查年度/时相<input name="coverage_period" value="${esc(record.coverage_period)}"></label><label class="field">项目阶段<input name="project_stage" value="${esc(record.project_stage)}" placeholder="未批复 / 已批复 / 在建 / 已验收"></label><label class="field">比例尺<input name="scale" value="${esc(record.scale)}"></label><label class="field">坐标系<input name="coordinate_system" value="${esc(record.coordinate_system)}"></label><label class="field">影像分辨率<input name="resolution" value="${esc(record.resolution)}"></label><label class="field">标签<input name="tags" value="${esc((record.tags||[]).join('，'))}"></label><label class="field full">关联证据ID<input name="related_evidence_ids" value="${esc((record.related_evidence_ids||[]).join('，'))}" placeholder="逗号分隔，须为本行业已有证据"></label><label class="field full">适用范围与限制<textarea name="notes">${esc(record.notes)}</textarea></label></div><div class="dialog-actions"><button class="primary" type="submit">保存资料</button></div></form>`);  arrangeMaterialForm();
 }
 function arrangeMaterialForm(){
   const form=$('#material-form'),grid=form.querySelector('.form-grid');
@@ -176,11 +326,144 @@ async function saveMaterialForm(form,values){
   }
 }
 
+function selectedMaterials(){return materialRecords.filter(r=>materialSelection.has(materialKey(r)));}
+function syncMaterialSelection(){
+  const count=$('#material-selection-count');if(count)count.textContent=`已选 ${materialSelection.size} 份 / 最多10份`;
+  const all=$('#material-select-all');if(all)all.checked=materialRecords.length>0&&materialRecords.every(r=>materialSelection.has(materialKey(r)));
+}
+function verificationMessages(errors=[]){return errors.length?`<div class="verification-errors" role="alert"><strong>以下资料未完成：</strong>${errors.map(e=>`<p>${esc(e.title||e.material_id||'资料')}：${esc(e.error||e.message||'操作失败')}</p>`).join('')}</div>`:'';}
+async function prepareVerification(items,mode){
+  if(verificationPreparing)return;
+  if(!items.length){toast('先选择需要核验的资料');return;}
+  if(items.length>10){toast('每批最多核验10份，请减少选择');return;}
+  let authorizationErrors=[];
+  if(mode==='automatic'){
+    const denied=items.filter(r=>r.model_allowed!==true||r.sensitivity==='restricted');
+    authorizationErrors=denied.map(r=>({title:r.title,error:r.sensitivity==='restricted'?'受限资料不能发送模型，请改用手动核验':'尚未允许模型引用，请在编辑资料中授权后重试，或改用手动核验'}));
+    items=items.filter(r=>r.model_allowed===true&&r.sensitivity!=='restricted');
+    if(!items.length){dialog('自动核验需要资料授权',`<p>自动核验会将本次所需原文片段发送给已配置的模型。请先在资料编辑中勾选“允许模型使用检索片段”；受限资料只能手动核验。</p>${verificationMessages(authorizationErrors)}`);return;}
+  }
+  verificationPreparing=true;
+  const controls=[...document.querySelectorAll('[data-action]')].filter(b=>b.dataset.action.startsWith('verify-'));controls.forEach(b=>b.disabled=true);
+  toast(mode==='automatic'?'正在检查资料，请稍候…':'正在准备资料核验…');
+  try{
+    const result=await api('/verifications/materials','POST',{items:items.map(r=>({industry_id:r.industry_id,material_id:r.id||r.material_id})),mode});
+    const reviews=result.items||[],errors=[...authorizationErrors,...(result.errors||[])];
+    if(S.view==='materials')await render();
+    if(reviews.length){showVerificationReviews(reviews,errors);if(mode==='manual')await submitVerificationDecisions($('#verification-decision-form'),'approve');}
+    else dialog('未生成核验任务',verificationMessages(errors)||'<p>没有可供审核的核验任务。</p>');
+  }finally{verificationPreparing=false;controls.forEach(b=>b.disabled=false);}
+}
+function verificationNeedsExtraction(review){return !review.extraction_job&&review.status==='approved'&&review.extraction_status==='failed';}
+function verificationExtracting(review){return review.status==='approved'&&extractionActive(review.extraction_job);}
+function verificationCanApprove(review){return review.status==='pending'||verificationNeedsExtraction(review);}
+function verificationResult(review){
+  if(review.status!=='approved')return review.status==='rejected'?'暂不通过，未入库':verificationLabels[review.status]||'待确认';
+  if(review.extraction_job)return '资料已通过，'+extractionSummary(review.extraction_job);
+  if(verificationNeedsExtraction(review))return '资料已通过，证据提取失败，可重试'+(review.extraction_error?'：'+review.extraction_error:'');
+  if(review.extraction_status==='pending')return '资料已通过，尚无全文提取任务，请在资料中重新提取证据';
+  if(review.status==='approved')return review.evidence_ids?.length?(review.extraction_method==='source_excerpt'?`核验已通过，已保存${review.evidence_ids.length}条原文摘录证据`:`核验已通过，已提取并入库${review.evidence_ids.length}条证据`):'资料已通过，未提取到可入库证据';
+  return review.status==='rejected'?'暂不通过，未入库':verificationLabels[review.status]||'待确认';
+}
+function verificationReviewCard(review,compact=false){
+  const source=review.source||{},sourceText=typeof source==='string'?source:[source.title,source.url].filter(Boolean).join(' · ');
+  const summary=review.summary||source.summary||review.excerpts?.[0]?.text||'';
+  return `<section class="verification-review" data-review-id="${esc(review.id)}" data-review-industry="${esc(review.industry_id)}"><h3>${esc(review.title||'资料核验')}</h3>${!compact&&sourceText?`<p class="description">来源：${esc(sourceText)}</p>`:''}${!compact&&summary?`<p class="description">${esc(summary.slice(0,180))}${summary.length>180?'…':''}</p>`:''}${review.status==='pending'&&review.mode==='automatic'&&review.findings?.length?`<div class="verification-findings">${review.findings.slice(0,5).map(f=>`<p>${esc(typeof f==='string'?f:f.detail||f.message||'请核对资料内容')}</p>`).join('')}</div>`:''}${review.mode==='automatic'?`<p class="description">${esc(review.coverage_note||'模型仅检查已授权的部分片段，不代表全文及外部真实性已核实。')}</p>`:''}<p class="description" data-review-result>${esc(verificationResult(review))}</p>${extractionHost(review.extraction_job,false,review.status!=='approved')}</section>`;
+}
+function finishManualVerification(form,reviews,errors=[]){
+  if(!form.isConnected||errors.length||!reviews.length||reviews.some(r=>r.mode!=='manual'||r.status!=='approved'||(!r.extraction_job&&r.extraction_status!=='completed')||r.decision_error))return;
+  if(reviews.some(r=>r.extraction_job)){ $('#dialog').close();toast(reviews.some(r=>r.extraction_job?.mode==='hard_chunk_index')?'资料核验已通过，全文索引已建立':'资料核验已通过，全文证据提取已交给后台处理');scheduleExtractionPoll();return; }
+  const count=reviews.reduce((total,r)=>total+(r.evidence_ids?.length||0),0);
+  $('#dialog').close();toast(count?`核验已通过，已入库${count}条证据`:'核验已通过，未提取到可入库证据');
+}
+function showVerificationReviews(reviews,errors=[]){
+  verificationReviews=reviews;
+  const pending=reviews.filter(r=>r.status==='pending'),actionable=reviews.some(verificationCanApprove);
+  dialog(reviews.length>1?`批量核验资料 · ${reviews.length}份`:'核验资料',`${verificationMessages(errors)}<form id="verification-decision-form">${reviews.map(r=>verificationReviewCard(r,reviews.length>1)).join('')}<p class="description">通过后自动切分全文并建立检索索引。资料核验不代表项目已批复或已实施。</p><div id="verification-results" role="status"></div><div class="dialog-actions"><button type="button" class="secondary" data-action="refresh-verifications" ${reviews.some(verificationExtracting)?'':'hidden'}>刷新提取状态</button>${actionable?`<button type="button" class="secondary" data-action="reject-verifications" ${pending.length?'':'disabled'}>暂不通过</button><button type="submit" class="primary">${pending.length?(reviews.length>1?'全部通过':'通过核验'):'重试提取'}</button>`:''}</div></form>`);
+  $('#verification-decision-form').verificationReviews=reviews;
+  $('#verification-decision-form').verificationErrors=errors;
+}
+async function openVerification(industry,id){const review=await api('/verifications/'+encodeURIComponent(industry)+'/'+encodeURIComponent(id));showVerificationReviews([review]);}
+async function refreshVerificationStatus(form){
+  if(!form||form.dataset.saving==='true')return;
+  form.dataset.saving='true';const controls=[...form.querySelectorAll('button')];controls.forEach(b=>b.disabled=true);
+  try{
+    const reviews=form.verificationReviews||[],active=reviews.filter(verificationExtracting),errors=[...(form.verificationErrors||[])];
+    const results=await Promise.allSettled(active.map(r=>api('/verifications/'+encodeURIComponent(r.industry_id)+'/'+encodeURIComponent(r.id))));
+    results.forEach((result,index)=>result.status==='fulfilled'?Object.assign(active[index],result.value):errors.push({title:active[index].title,error:result.reason.message}));
+    if(form.isConnected){showVerificationReviews(reviews,errors);finishManualVerification($('#verification-decision-form'),reviews,errors);}
+    if(S.view==='materials')await render();
+  }finally{form.dataset.saving='false';controls.forEach(b=>b.disabled=false);}
+}
+async function showVerificationQueue(){
+  const result=await api('/verifications?'+new URLSearchParams({industry:S.industry,status:'pending'}));
+  verificationQueue=Array.isArray(result)?result:result.items||[];
+  dialog('待核验资料',`<p class="description">选择资料确认通过，系统自动建立全文检索索引。</p><div class="verification-queue">${verificationQueue.map((r,index)=>`<div class="report-row"><label><input name="verification-pick" type="checkbox" value="${index}"> ${esc(r.title||r.material_id)}</label><button class="secondary" data-action="open-verification" data-id="${esc(r.id)}" data-industry="${esc(r.industry_id)}">核验资料</button></div>`).join('')||empty('暂无待核验资料','从资料的“核验资料”或“自动核验”开始。')}</div>${verificationQueue.length?'<div class="dialog-actions"><button class="primary" data-action="preview-verifications">核验所选资料</button></div>':''}`);
+}
+async function previewSelectedVerifications(){
+  const items=[...document.querySelectorAll('[name="verification-pick"]')].filter(b=>b.checked).map(b=>verificationQueue[Number(b.value)]);
+  if(!items.length){toast('先选择待审核任务');return;}if(items.length>10){toast('每批最多审核10份');return;}
+  const results=await Promise.allSettled(items.map(r=>api('/verifications/'+encodeURIComponent(r.industry_id)+'/'+encodeURIComponent(r.id))));
+  const reviews=[],errors=[];results.forEach((r,i)=>r.status==='fulfilled'?reviews.push(r.value):errors.push({title:items[i].title,error:r.reason.message}));
+  if(reviews.length)showVerificationReviews(reviews,errors);else dialog('核验任务读取失败',verificationMessages(errors));
+}
+async function submitVerificationDecisions(form,decision){
+  if(form.dataset.saving==='true')return;
+  const reviews=form.verificationReviews||verificationReviews;
+  const requests=reviews.filter(r=>decision==='approve'?verificationCanApprove(r):r.status==='pending');
+  if(!requests.length){toast('这些资料已处理');return;}
+  form.dataset.saving='true';const controls=[...form.querySelectorAll('button')];controls.forEach(b=>b.disabled=true);
+  try{
+    for(const review of requests){
+      try{
+        const result=await api('/verifications/'+encodeURIComponent(review.industry_id)+'/'+encodeURIComponent(review.id)+'/decision','POST',{decision}),saved=result.review||result,expected=decision==='approve'?'approved':'rejected';
+        if(saved.status!==expected)throw new Error('未取得核验结果，请重新打开资料查看状态。');
+        Object.assign(review,saved);delete review.decision_error;
+      }
+      catch(error){review.decision_error=error.message;}
+      const card=[...form.querySelectorAll('.verification-review')].find(c=>c.dataset.reviewId===review.id&&c.dataset.reviewIndustry===review.industry_id);
+      if(card){card.querySelector('[data-review-result]').textContent='';card.querySelector('.verification-findings')?.remove();if(review.extraction_job){const host=document.createElement('div');host.innerHTML=extractionHost(review.extraction_job);card.append(host);scheduleExtractionPoll();}}
+    }
+    form.querySelector('#verification-results').textContent=reviews.map(r=>`${r.title}：${r.decision_error?'失败，'+r.decision_error:verificationResult(r)}`).join('\n');
+    if(S.view==='materials')await render();
+    finishManualVerification(form,reviews,form.verificationErrors||[]);
+  }finally{
+    form.dataset.saving='false';
+    const pending=reviews.some(r=>r.status==='pending'),extracting=reviews.some(verificationExtracting);
+    controls.forEach(b=>{if(b.dataset.action==='refresh-verifications'){b.hidden=!extracting;b.disabled=false;}else b.disabled=b.dataset.action==='reject-verifications'?!pending:!reviews.some(verificationCanApprove);});
+    const approve=form.querySelector('[type="submit"]');if(approve)approve.textContent=pending?(reviews.length>1?'全部通过':'通过核验'):reviews.some(verificationNeedsExtraction)?'重试提取':extracting?'正在提取证据':decision==='reject'?'暂不通过':'核验已通过';
+  }
+}
+function appendAgentVerification(container,event,industry){
+  const review={id:event.id,industry_id:event.industry_id||industry,title:event.title||'资料核验',status:'pending'};
+  const card=document.createElement('div');card.className='citation verification-required';
+  const title=document.createElement('strong');title.textContent=review.title;
+  const question=document.createElement('p');question.textContent='是否通过资料核验？通过后自动建立全文检索索引。';
+  const actions=document.createElement('div');actions.className='material-review-actions';
+  const approve=document.createElement('button');approve.className='primary';approve.textContent='通过核验并入库';
+  const reject=document.createElement('button');reject.className='secondary';reject.textContent='暂不通过';
+  const result=document.createElement('p');result.className='description';result.setAttribute('role','status');
+  let saving=false;
+  const decide=async decision=>{
+    if(saving||!(decision==='approve'?verificationCanApprove(review):review.status==='pending'))return;
+    saving=true;approve.disabled=true;reject.disabled=true;result.textContent=decision==='approve'?'正在通过核验并建立全文索引…':'正在保存…';
+    try{
+      const response=await api('/verifications/'+encodeURIComponent(review.industry_id)+'/'+encodeURIComponent(review.id)+'/decision','POST',{decision}),saved=response.review||response;
+      if(saved.status!==(decision==='approve'?'approved':'rejected'))throw new Error('未取得核验结果，请重试。');
+      Object.assign(review,saved);result.textContent=verificationResult(review);if(review.extraction_job){const host=document.createElement('div');host.innerHTML=extractionHost(review.extraction_job);card.append(host);scheduleExtractionPoll();}if(S.view==='materials')await render();
+    }catch(error){result.textContent='操作失败：'+error.message;}
+    finally{saving=false;approve.disabled=!verificationCanApprove(review);reject.disabled=review.status!=='pending';approve.textContent=verificationNeedsExtraction(review)?'重试提取':review.status==='approved'?(review.extraction_job||review.extraction_status==='pending'?'核验已通过':'已完成'):'通过核验并入库';}
+  };
+  approve.onclick=()=>decide('approve');reject.onclick=()=>decide('reject');
+  actions.append(approve,reject);card.append(title,question,actions,result);container.append(card);
+}
 async function viewMaterial(industry,id){
   const r=await api('/materials/'+industry+'/'+id);
-  const fields=[['归属档案',industryName(r.industry_id)],['类型',r.kind_label],['编号',r.number],['版本',r.version],['地域',r.region],['发布机构',r.issuer],['有效性',r.status_label],['发布日期',r.published_date],['实施日期',r.effective_date],['核验日期',r.checked_date||'尚未核验'],['复核日期',r.review_after],['项目阶段',r.project_stage],['调查年度/时相',r.coverage_period],['比例尺',r.scale],['坐标系',r.coordinate_system],['影像分辨率',r.resolution],['模型引用',r.model_allowed?'允许引用片段':'仅本地管理'],['原件大小',r.attachment?.bytes?(r.attachment.bytes/1000000).toFixed(1)+' MB':''],['提取正文',r.extraction?.text_index?r.extraction.characters+' 字符 / '+r.extraction.sections+' 个分段':''],['段落与表格',r.extraction?.paragraphs?r.extraction.paragraphs+' 段落 / '+r.extraction.tables+' 表格':'']];
-  dialog(r.title,`<div class="detail-meta">${fields.filter(([,v])=>v).map(([k,v])=>`<div>${esc(k)}<strong>${esc(v)}</strong></div>`).join('')}</div>${r.review_due?'<p class="notice">已到复核期限，需重新核对原文。</p>':''}<div class="detail-summary">${esc(r.summary)}</div>${r.url?`<a href="${esc(safeURL(r.url))}" target="_blank" rel="noopener noreferrer">原始来源 ↗</a>`:''}<p class="description">${esc(r.notes)} ${esc(r.extraction?.note||'')}</p>${r.related_evidence_ids?.length?`<p class="description">关联证据：${r.related_evidence_ids.map(esc).join('、')}</p>`:''}<details><summary>查看正文 / 可引用位置</summary><pre class="material-body">${esc(r.content||'尚未提供正文')}</pre></details><div class="dialog-actions">${r.has_attachment?`<a class="secondary" href="/api/materials/${industry}/${id}/file">下载原附件</a>`:''}${r.extraction?.text_index?'<button class="secondary" id="read-material-sections">检索分段原文</button>':''}<button class="primary" id="edit-material">编辑资料</button></div>`);
+  const fields=[['归属档案',industryName(r.industry_id)],['类型',r.kind_label],['编号',r.number],['版本',r.version],['地域',r.region],['发布机构',r.issuer],['有效性',materialValidity(r)],['核验状态',materialVerificationText(r)],['发布日期',r.published_date],['实施日期',r.effective_date],['资料核对日期',r.checked_date||'尚未核对'],['复核日期',r.review_after],['项目阶段',r.project_stage],['调查年度/时相',r.coverage_period],['比例尺',r.scale],['坐标系',r.coordinate_system],['影像分辨率',r.resolution],['模型引用',r.model_allowed?'允许引用片段':'仅本地管理'],['原件大小',r.attachment?.bytes?(r.attachment.bytes/1000000).toFixed(1)+' MB':''],['提取正文',r.extraction?.text_index?r.extraction.characters+' 字符 / '+r.extraction.sections+' 个分段':''],['段落与表格',r.extraction?.paragraphs?r.extraction.paragraphs+' 段落 / '+r.extraction.tables+' 表格':'']];
+  dialog(r.title,`<div class="detail-meta">${fields.filter(([,v])=>v).map(([k,v])=>`<div>${esc(k)}<strong>${esc(v)}</strong></div>`).join('')}</div>${r.review_due?'<p class="notice">已到复核期限，需重新核对原文。</p>':''}<div class="detail-summary">${esc(r.summary)}</div>${r.url?`<a href="${esc(safeURL(r.url))}" target="_blank" rel="noopener noreferrer">原始来源 ↗</a>`:''}<p class="description">${esc(r.notes)} ${esc(r.extraction?.note||'')}</p>${r.related_evidence_ids?.length?`<p class="description">关联证据：${r.related_evidence_ids.map(eid=>`<button class="link-button" data-action="view-related-evidence" data-id="${esc(eid)}" data-industry="${esc(industry)}">${esc(eid)}</button>`).join('、')}</p>`:''}<details><summary>查看正文 / 可引用位置</summary><pre class="material-body">${esc(r.content||'尚未提供正文')}</pre></details>${materialExtractionHost(r,true)}<div class="material-review-actions">${materialVerificationAction(r,true)}<button class="secondary" id="verify-material-automatic">自动核验</button><button class="secondary" data-action="verification-queue">待核验资料</button></div><div class="dialog-actions">${r.has_attachment?`<a class="secondary" href="/api/materials/${encodeURIComponent(industry)}/${encodeURIComponent(id)}/file">下载原附件</a>`:''}${r.extraction?.text_index?'<button class="secondary" id="read-material-sections">检索分段原文</button>':''}<button class="primary" id="edit-material">编辑资料</button></div>`);
   $('#edit-material').onclick=()=>materialDialog(r);
+  if($('#verify-material-manual'))$('#verify-material-manual').onclick=()=>prepareVerification([r],'manual').catch(handleError);
+  $('#verify-material-automatic').onclick=()=>prepareVerification([r],'automatic').catch(handleError);
   if(r.extraction?.text_index)$('#read-material-sections').onclick=()=>showMaterialSections(industry,id,r.title).catch(handleError);
 }
 async function renderMemory(){
@@ -232,7 +515,7 @@ async function renderEvidence(){
   const selected=researchProfiles();
   const cats=[...new Set([...selected.flatMap(i=>i.scope.topics||[]),...records.map(r=>r.category)])];
   const review=S.reviewOnly;
-  $('#content').innerHTML=libraryHeader()+librarySearch()+`<div class="library-actions"><label><input id="review-only" type="checkbox" ${review?'checked':''}> 只看待核验与需复核</label><button class="link-button" data-action="manual-evidence">＋ 录入知识证据</button></div><div class="filter-row"><div class="tabs">${[['','全部证据'],['confirmed','已核验'],['reported','来源声称'],['planned','计划 / 目标']].map(([state,label])=>`<button class="tab ${S.status===state?'active':''}" data-status="${state}">${label}</button>`).join('')}</div><div class="filters"><select id="category-filter" aria-label="分类筛选">${options([['','全部分类'],...cats.map(c=>[c,c])],S.category)}</select><select id="freshness-filter" aria-label="时效筛选">${options([['','全部时效'],['current','未到复核期限'],['review_due','待复核'],['needs_verification','待核验'],['expired','已过有效期'],['superseded','已被替代']],S.freshness)}</select></div></div><div class="section-caption"><span>${review?'复核清单':'证据记录'} · ${records.length} 条匹配</span><span>核验日期 ↓ · 最多展示100条</span></div><div class="evidence-list">${records.length?records.map(r=>`<article class="evidence-card" data-record="${esc(r.id)}" data-industry="${esc(r.industry_id)}" tabindex="0" role="button" aria-label="查看 ${esc(r.title)}"><div class="card-top"><div class="category"><span>${esc(r.category)}</span><span>/ ${esc(industryName(r.industry_id))}</span></div>${badge(r.status,labels[r.status])}</div><h3>${esc(r.title)}</h3><p class="summary">${esc(r.summary)}</p><div class="card-foot"><div class="card-foot-left"><span>◈ ${esc(r.publisher)}</span><span>核验 ${esc(r.checked_date)}</span>${r.freshness!=='current'?badge(r.freshness,r.freshness_label):''}</div><div class="actions">${(r.tags||[]).slice(0,1).map(t=>`<span class="tag">${esc(t)}</span>`).join('')}<a href="${esc(safeURL(r.url))}" target="_blank" rel="noopener noreferrer">原始来源 ↗</a></div></div></article>`).join(''):empty(review?'没有待复核的匹配资料':'没有匹配的证据',review?'未到复核期限不代表事实持续成立。':'试试减少关键词，或先建立行业并添加公开来源。')}</div>`;
+  $('#content').innerHTML=libraryHeader()+librarySearch()+`<div class="library-actions"><label><input id="review-only" type="checkbox" ${review?'checked':''}> 只看待核验与需复核</label><button class="link-button" data-action="manual-evidence">＋ 录入知识证据</button></div><div class="filter-row"><div class="tabs">${[['','全部证据'],['confirmed','已核验'],['reported','来源声称'],['planned','计划 / 目标']].map(([state,label])=>`<button class="tab ${S.status===state?'active':''}" data-status="${state}">${label}</button>`).join('')}</div><div class="filters"><select id="category-filter" aria-label="分类筛选">${options([['','全部分类'],...cats.map(c=>[c,c])],S.category)}</select><select id="freshness-filter" aria-label="时效筛选">${options([['','全部时效'],['current','未到复核期限'],['review_due','待复核'],['needs_verification','待核验'],['expired','已过有效期'],['superseded','已被替代']],S.freshness)}</select></div></div><div class="section-caption"><span>${review?'复核清单':'证据记录'} · ${records.length} 条匹配</span><span>核验日期 ↓ · 最多展示100条</span></div><div class="evidence-list">${records.length?records.map(r=>`<article class="evidence-card" data-record="${esc(r.id)}" data-industry="${esc(r.industry_id)}" tabindex="0" role="button" aria-label="查看 ${esc(r.title)}"><div class="card-top"><div class="category"><span>${esc(r.category)}</span><span>/ ${esc(industryName(r.industry_id))}</span></div>${badge(r.status,labels[r.status])}</div><h3>${esc(r.title)}</h3><p class="summary">${esc(r.summary)}</p><div class="card-foot"><div class="card-foot-left"><span>◈ ${esc(r.publisher)}</span><span>核验 ${esc(r.checked_date)}</span>${r.freshness!=='current'?badge(r.freshness,r.freshness_label):''}</div><div class="actions">${(r.tags||[]).slice(0,1).map(t=>`<span class="tag">${esc(t)}</span>`).join('')}${r.url?`<a href="${esc(safeURL(r.url))}" target="_blank" rel="noopener noreferrer">原始来源 ↗</a>`:r.material_source?'<span class="tag">本地资料证据</span>':''}</div></div></article>`).join(''):empty(review?'没有待复核的匹配资料':'没有匹配的证据',review?'未到复核期限不代表事实持续成立。':'试试减少关键词，或先建立行业并添加公开来源。')}</div>`;
 }
 function renderIndustries(){
   $('#settings-archives').innerHTML=`<div class="actions"><button class="secondary" data-action="add-industry">＋ 新建档案</button><button class="secondary" data-action="add-forestry-region">＋ 新增林草地区</button></div>`+
@@ -257,7 +540,7 @@ async function renderReports(){
 async function renderSettings(){
   $('#content').innerHTML=heading('设置','模型、资料范围与授权集中在这里管理。')+`<div class="settings-stack"><details class="settings-section"><summary>模型与助手</summary><div id="settings-model"></div></details><details class="settings-section"><summary>档案与范围</summary><div id="settings-archives"></div></details><details class="settings-section"><summary>信息来源</summary><div id="settings-sources"></div></details><details class="settings-section"><summary>偏好与对话保存</summary><div id="settings-memory"></div></details></div>`;
   const c=S.data.agent;
-  $('#settings-model').innerHTML=`<div class="panel"><h2>模型连接</h2><p class="description">使用支持工具调用的模型；API协议必须与服务端匹配。</p><form id="settings-form"><div class="form-grid"><label class="field">Provider ID<input name="provider_id" required value="${esc(c.provider_id)}"></label><label class="field">显示名称<input name="display_name" required value="${esc(c.display_name)}"></label><label class="field full">API Base URL<input name="base_url" type="url" required value="${esc(c.base_url)}" placeholder="http://127.0.0.1:8000/v1"></label><label class="field">API协议<select name="protocol">${options([['chat_completions','OpenAI Chat Completions'],['responses','OpenAI Responses']],c.protocol)}</select></label><label class="field">模型 ID<input name="model" required value="${esc(c.model)}"></label><label class="field full">API 密钥<input name="api_key" type="password" autocomplete="off" placeholder="${c.key_configured?'已有服务端密钥，留空保留':'输入密钥；本机接口可填 local'}"><small>输入后仅在服务端内存使用，不写浏览器存储或配置文件。重启时可通过 KB_MODEL_API_KEY 环境变量加载。</small></label><label class="field">每轮模型请求上限<input name="request_limit" type="number" min="1" max="30" value="${c.request_limit}"></label><label class="field">单轮超时（秒）<input name="timeout_seconds" type="number" min="30" max="900" value="${c.timeout_seconds}"></label></div><div class="provider-note">本机接口使用当前模型；厂商API会接收本次问答所用的证据片段。资料文件仍保存在本地。工具包括本地检索、网页搜索、批量采集、公开原文读取、验证入库和简报。</div><div class="actions"><button class="primary" type="submit">保存连接</button><button class="secondary" type="button" id="test-model">测试模型列表</button><a class="link-button" href="https://github.com/pydantic/pydantic-ai" target="_blank" rel="noopener noreferrer">SDK 源码 ↗</a></div><div id="connection-result" class="connection-result"></div></form></div><div class="panel"><h2>每天更新</h2><p class="description">${S.data.automation.status==='ACTIVE'?'外部调度配置：'+esc(S.data.automation.schedule)+'，北京时间。请确认对应调度已真实创建。':'尚未启用外部调度。行业开关不会安装定时任务。'} 页面Agent和批量采集按需启动。</p><div class="actions">${badge(S.data.automation.status==='PAUSED'?'superseded':'current',S.data.automation.status)}</div></div>`;
+  $('#settings-model').innerHTML=`<div class="panel"><h2>模型连接</h2><p class="description">使用支持工具调用的模型；API协议必须与服务端匹配。</p><form id="settings-form"><div class="form-grid"><label class="field">Provider ID<input name="provider_id" required value="${esc(c.provider_id)}"></label><label class="field">显示名称<input name="display_name" required value="${esc(c.display_name)}"></label><label class="field full">API Base URL<input name="base_url" type="url" required value="${esc(c.base_url)}" placeholder="http://127.0.0.1:8091/v1"></label><label class="field">API协议<select name="protocol">${options([['chat_completions','OpenAI Chat Completions'],['responses','OpenAI Responses']],c.protocol)}</select></label><label class="field">模型 ID<input name="model" required value="${esc(c.model)}"></label><label class="field full">API 密钥<input name="api_key" type="password" autocomplete="off" placeholder="${c.key_configured?'已有服务端密钥，留空保留':'输入密钥；本机接口可填 local'}"><small>输入后仅在服务端内存使用，不写浏览器存储或配置文件。重启时可通过 KB_MODEL_API_KEY 环境变量加载。</small></label><label class="field">每轮模型请求上限<input name="request_limit" type="number" min="1" max="30" value="${c.request_limit}"></label><label class="field">单轮超时（秒）<input name="timeout_seconds" type="number" min="30" max="900" value="${c.timeout_seconds}"></label></div><div class="provider-note">本机接口使用当前模型；厂商API会接收本次问答所用的证据片段。资料文件仍保存在本地。工具包括本地检索、网页搜索、批量采集、公开原文读取、验证入库和简报。</div><div class="actions"><button class="primary" type="submit">保存连接</button><button class="secondary" type="button" id="test-model">测试模型列表</button><a class="link-button" href="https://github.com/pydantic/pydantic-ai" target="_blank" rel="noopener noreferrer">SDK 源码 ↗</a></div><div id="connection-result" class="connection-result"></div></form></div><div class="panel"><h2>每天更新</h2><p class="description">已配置的Codex定时任务：${esc(S.data.automation.schedule)}，北京时间。运行时读取行业开关；电脑和Codex应用需运行。本页面的Agent按按钮启动，避免重复建立采集调度。</p><div class="actions">${badge(S.data.automation.status==='PAUSED'?'superseded':'current',S.data.automation.status)}</div></div>`;
   const n=S.data.network;
   $('#settings-model').innerHTML+=`<div class="panel"><h2>网页搜索后端</h2><p class="description">默认免密钥DDGS。也可接入支持JSON搜索的自有SearXNG实例；引擎不可用时可以切换，不会伪造结果。</p><form id="network-settings-form"><div class="form-grid"><label class="field">搜索服务<select name="provider">${options([['ddgs','DDGS · 无需API密钥'],['searxng','SearXNG · 自有实例']],n.provider)}</select></label><label class="field">DDGS搜索引擎<select name="backend">${options([['bing','Bing'],['duckduckgo','DuckDuckGo'],['brave','Brave']],n.backend)}</select></label><label class="field full">SearXNG Base URL<input name="searxng_url" type="url" value="${esc(n.searxng_url)}" placeholder="http://127.0.0.1:8080"></label><label class="field">搜索地区<select name="region">${options([['cn-zh','中国 · 中文'],['us-en','美国 · 英文'],['wt-wt','全球']],n.region)}</select></label></div><button class="primary" type="submit">保存搜索后端</button></form></div>`;
   renderIndustries();
@@ -272,7 +555,23 @@ function addForestryRegion(){
 
 function editScope(id){const entry=S.data.industries.find(i=>i.id===id), c=entry.scope;dialog('编辑 '+entry.name+' 的研究范围',`<form id="scope-form" data-id="${esc(id)}"><div class="form-grid"><label class="field">主要地区<input name="primary_region" value="${esc(c.primary_region)}" required></label><label class="field full">同时研究的地区（逗号分隔）<input name="research_regions" value="${esc((c.research_regions?.length>1?c.research_regions:[]).join('，'))}" placeholder="留空只研究主要地区"><small>保留原资料真实地区；模板关键词随研究范围调整，自定义关键词保留。当地信源需要另外管理。</small></label><label class="field">对照地区<input name="comparison_regions" value="${esc((c.comparison_regions||[]).join('，'))}"></label><label class="field full">分类<textarea name="topics" required>${esc(c.topics.join('，'))}</textarea><small>修改分类不自动重写已有事实；旧证据可单独编辑归档。</small></label><label class="field">默认复核周期（天）<input name="default_days" type="number" min="1" max="36500" value="${c.freshness?.default_days||30}"></label><label class="field">最近检索范围（天）<input name="lookback_days" type="number" min="1" value="${c.lookback_days}"></label><label class="field full">按分类设置复核周期（JSON对象）<textarea name="category_days">${esc(JSON.stringify(c.freshness?.category_days||{},null,2))}</textarea></label></div><div class="dialog-actions"><button class="primary" type="submit">保存范围</button></div></form>`);}
 function sourceDialog(id){const c=S.sources.sources.find(s=>s.id===id)||{};dialog(id?'编辑信息来源':'添加公开来源',`<form id="source-form" data-industry="${esc(S.sourceIndustry||chooseIndustry())}" data-original="${esc(id||'')}"><div class="form-grid"><label class="field">名称<input name="name" required value="${esc(c.name)}"></label><label class="field">来源编号<input name="id" required pattern="[a-z0-9][a-z0-9_-]{2,79}" value="${esc(c.id)}" ${id?'readonly':''}></label><label class="field full">公开入口URL<input type="url" name="url" required value="${esc(c.url)}"></label><label class="field">来源类型<select name="type">${options([['primary','官方原始来源'],['government','政府与监管'],['company','企业公告'],['agency_report','机构报告'],['media','媒体线索']],c.type||'primary')}</select></label><label class="field">优先级<input type="number" name="priority" min="1" max="5" value="${c.priority||1}"></label><label class="field full">适用分类<input name="categories" value="${esc((c.categories||[]).join('，'))}" placeholder="逗号分隔"></label><label class="field full">备注<textarea name="notes">${esc(c.notes)}</textarea></label></div><div class="provider-note">新增或更改地址会标记为待核验。暂停来源不会删除旧证据。</div><div class="dialog-actions"><button class="primary" type="submit">保存来源</button></div></form>`);$('#source-form').sourceCatalog=structuredClone(S.sources);}
-async function showRecord(industry,id){const r=await api(`/evidence/${industry}/${id}`);dialog(r.title,`<div class="actions">${badge(r.status,labels[r.status])}${badge(r.freshness,r.freshness_label)}</div><div class="detail-meta"><div>发布机构<strong>${esc(r.publisher)}</strong></div><div>主分类<strong>${esc(r.category)}</strong></div><div>发布日期<strong>${esc(r.published_date||'未知')}</strong></div><div>事件日期<strong>${esc(r.event_date||'未知 / 不适用')}</strong></div><div>核验日期<strong>${esc(r.checked_date)}</strong></div><div>复核期限<strong>${esc(r.review_due_date)}</strong></div></div><div class="detail-summary">${esc(r.summary)}</div><p><a href="${esc(safeURL(r.url))}" target="_blank" rel="noopener noreferrer">阅读原始来源 ↗</a></p><div class="detail-limit"><strong>适用范围与限制</strong><br>${esc(r.limitations||'未填写，需补充。')}</div>${r.metrics?.length?`<details><summary>数字与统计口径 (${r.metrics.length})</summary><pre class="json">${esc(JSON.stringify(r.metrics,null,2))}</pre></details>`:''}<details><summary>历史版本 (${r.history.length})</summary>${r.history.length?r.history.map(h=>`<p>${esc(h.updated_at)} · ${esc(labels[h.status])}</p><div class="detail-limit">${esc(h.summary)}</div>`).join(''):'<p>尚无修订，原记录仍保留。</p>'}</details><div class="dialog-actions"><button class="secondary" id="edit-evidence">编辑归档信息</button><button class="primary" id="ask-record">询问这条证据</button></div>`);$('#edit-evidence').onclick=()=>manualEvidence(r,industry);$('#ask-record').onclick=()=>{$('#dialog').close();$('#chat-input').value=`解释证据 ${r.id}：${r.title}，说明原始来源、核验日期、限制和可继续调查的问题。`;openAgent();$('#chat-input').focus();};}
+async function showRecord(industry,id){
+  const r=await api(`/evidence/${encodeURIComponent(industry)}/${encodeURIComponent(id)}`),source=r.material_source||r.related_material,history=r.history||[];
+  dialog(r.title,`<div class="actions">${badge(r.status,labels[r.status])}${badge(r.freshness,r.freshness_label)}</div><div class="detail-meta"><div>发布机构<strong>${esc(r.publisher)}</strong></div><div>主分类<strong>${esc(r.category)}</strong></div><div>发布日期<strong>${esc(r.published_date||'未知')}</strong></div><div>事件日期<strong>${esc(r.event_date||'未知 / 不适用')}</strong></div><div>核验日期<strong>${esc(r.checked_date)}</strong></div><div>复核期限<strong>${esc(r.review_due_date)}</strong></div></div><div class="detail-summary">${esc(r.summary)}</div>${r.url?`<p><a href="${esc(safeURL(r.url))}" target="_blank" rel="noopener noreferrer">阅读原始来源 ↗</a></p>`:''}${source?`<div class="verification-origin"><strong>本地原始资料</strong><p>引用位置：${esc(source.citation)}</p><pre class="material-body">${esc(source.quote)}</pre><button class="secondary" id="open-evidence-material">打开关联资料</button><button class="secondary" id="locate-evidence-material">定位原文片段</button></div>`:''}<div class="detail-limit"><strong>适用范围与限制</strong><br>${esc(r.limitations||'未填写，需补充。')}</div>${r.metrics?.length?`<details><summary>数字与统计口径 (${r.metrics.length})</summary><pre class="json">${esc(JSON.stringify(r.metrics,null,2))}</pre></details>`:''}<details><summary>历史版本 (${history.length})</summary>${history.length?history.map(h=>`<p>${esc(h.updated_at)} · ${esc(labels[h.status])}</p><div class="detail-limit">${esc(h.summary)}</div>`).join(''):'<p>尚无修订，原记录仍保留。</p>'}</details><div class="dialog-actions"><button class="secondary" id="edit-evidence">编辑归档信息</button><button class="primary" id="ask-record">询问这条证据</button></div>`);
+  if(source){
+    $('#open-evidence-material').onclick=()=>viewMaterial(source.industry_id,source.material_id).catch(handleError);
+    $('#locate-evidence-material').onclick=async()=>{try{const material=await api('/materials/'+encodeURIComponent(source.industry_id)+'/'+encodeURIComponent(source.material_id));if(material.extraction?.text_index){const block=/#block-(\d+)/.exec(source.citation||'');await showMaterialSections(source.industry_id,source.material_id,material.title,'',block?Math.max(0,Number(block[1])-1):0);}else{await viewMaterial(source.industry_id,source.material_id);const notice=document.createElement('div');notice.className='verification-origin';notice.textContent=`引用位置：${source.citation}\n${source.quote}`;$('#dialog-body').prepend(notice);}}catch(error){handleError(error);}};
+  }
+  const supports=r.supporting_sources||r.supports||source?.supports||[];
+  if(supports.length){
+    const section=document.createElement('section');section.className='verification-origin';
+    section.innerHTML=`<strong>关联原文引用 (${supports.length})</strong>${supports.map((support,index)=>`<div class="evidence-support"><p>引用位置：${esc(support.citation||support.location||support.unit_id||'原文位置')}</p><pre class="material-body">${esc(support.quote||support.text||'')}</pre><button class="secondary" data-support-index="${index}">查看原文</button></div>`).join('')}`;
+    $('#dialog-body').append(section);
+    section.querySelectorAll('[data-support-index]').forEach(button=>{button.onclick=async()=>{try{const support=supports[Number(button.dataset.supportIndex)],originIndustry=support.industry_id||source?.industry_id||industry,materialId=support.material_id||source?.material_id||r.material_id;if(!materialId){toast('此引用未关联资料目录');return;}const original=await api('/materials/'+encodeURIComponent(originIndustry)+'/'+encodeURIComponent(materialId)),block=/#block-(\d+)/.exec(support.citation||'');if(original.extraction?.text_index)await showMaterialSections(originIndustry,materialId,original.title,block?'':String(support.quote||support.text||'').slice(0,60),block?Math.max(0,Number(block[1])-1):0);else await viewMaterial(originIndustry,materialId);}catch(error){handleError(error);}};});
+  }
+  $('#edit-evidence').onclick=()=>manualEvidence(r,industry);
+  $('#ask-record').onclick=()=>{$('#dialog').close();$('#chat-input').value=`解释证据 ${r.id}：${r.title}，说明原始来源、核验日期、限制和可继续调查的问题。`;openAgent();$('#chat-input').focus();};
+}
 function manualEvidence(record=null,industry=chooseIndustry()){
   if(!industry){toast('请先建立一个行业');return;}
   const clean=record?Object.fromEntries(Object.entries(record).filter(([k])=>!['industry_id','freshness','freshness_label','review_due_date','as_of','path','history'].includes(k))):{title:'',summary:'',url:'',publisher:'',region:'中国',category:S.data.industries.find(i=>i.id===industry).scope.topics[0],status:'needs_verification',checked_date:S.data.as_of,published_date:null,event_date:null,tags:[],limitations:'',metrics:[]};
@@ -300,7 +599,8 @@ async function sendAgent(crawlId=null){
       if(event.type==='chart'){const key=String(event.seq??JSON.stringify(event.chart));if(!seenCharts.has(key)&&seenCharts.size<3){seenCharts.add(key);appendResearchChart(figures,event.chart);}}
       if(event.type==='answer')text.innerHTML=markdown(event.text);
       if(event.type==='report'){const button=document.createElement('button');button.className='citation';button.textContent='阅读生成的证据简报 ↗';button.onclick=()=>openDoc(event.path).catch(handleError);eventLog.append(button);}
-      if(event.type==='done'){S.stream.close();S.stream=null;S.job=null;$('#send-agent').disabled=false;$('#stop-agent').hidden=true;if(event.archived_ids?.length)await refresh();}
+      if(event.type==='verification_required')appendAgentVerification(eventLog,event,industry);
+      if(event.type==='done'){S.stream.close();S.stream=null;S.job=null;$('#send-agent').disabled=false;$('#stop-agent').hidden=true;if(event.archived_ids?.length||event.pending_review_ids?.length)await refresh();}
       $('#chat-log').scrollTop=$('#chat-log').scrollHeight;
     });
     S.stream.onerror=()=>{if(S.job){text.textContent='事件连接中断，正在尝试恢复；可点击停止取消任务。';}};
@@ -329,10 +629,22 @@ document.addEventListener('click',async e=>{try{
     case'add-material':materialDialog();break;
     case'add-forestry-region':addForestryRegion();break;
     case'view-material':await viewMaterial(action.dataset.industry,id);break;
+    case'view-related-evidence':await showRecord(action.dataset.industry,id);break;
+    case'restart-material-extraction':await startMaterialExtraction(action.dataset.industry,id,action);break;
+    case'view-extraction':case'refresh-extraction':await openExtraction(action.dataset.industry,id);break;
+    case'control-extraction':await controlExtraction(action.dataset.industry,id,action.dataset.control,action);break;
+    case'verify-material-manual':case'verify-material-automatic':{const record=materialRecords.find(r=>r.id===id&&r.industry_id===action.dataset.industry);if(record)await prepareVerification([record],action.dataset.action.endsWith('automatic')?'automatic':'manual');break;}
+    case'verify-selected-manual':case'verify-selected-automatic':await prepareVerification(selectedMaterials(),action.dataset.action.endsWith('automatic')?'automatic':'manual');break;
+    case'verification-queue':await showVerificationQueue();break;
+    case'open-verification':await openVerification(action.dataset.industry,id);break;
+    case'refresh-verifications':await refreshVerificationStatus($('#verification-decision-form'));break;
+    case'preview-verifications':await previewSelectedVerifications();break;
+    case'retry-material-extraction':{const review=await api('/verifications/'+encodeURIComponent(action.dataset.industry)+'/'+encodeURIComponent(id));showVerificationReviews([review]);await submitVerificationDecisions($('#verification-decision-form'),'approve');break;}
+    case'reject-verifications':await submitVerificationDecisions($('#verification-decision-form'),'reject');break;
     case'professional-prompt':$('#chat-input').value=action.dataset.prompt;openAgent();$('#chat-input').focus();break;
     case'add-memory':memoryDialog();break;
     case'archive-memory':await api('/memories/'+id+'/archive','POST',{});await renderMemory();toast('记忆已停用，记录保留');break;
-    case'view-conversation':{const c=conversationRecords[Number(id)];dialog('历史对话',c.turns.map((t,index)=>`<div class="detail-limit"><strong>你 · ${esc(t.at)}</strong><p>${esc(t.prompt)}</p><strong>研究助手</strong><div data-history-chart="${index}"></div><div>${markdown(t.answer)}</div></div>`).join(''));document.querySelectorAll('[data-history-chart]').forEach(host=>(c.turns[Number(host.dataset.historyChart)].charts||[]).slice(0,3).forEach(chart=>appendResearchChart(host,chart)));break;}
+    case'view-conversation':{const c=conversationRecords[Number(id)];dialog('历史对话',c.turns.map((t,index)=>`<div class="detail-limit"><strong>你 · ${esc(t.at)}</strong><p>${esc(t.prompt)}</p><strong>研究助手</strong><div data-history-chart="${index}"></div><div class="answer-markdown">${markdown(t.answer)}</div></div>`).join(''));document.querySelectorAll('[data-history-chart]').forEach(host=>(c.turns[Number(host.dataset.historyChart)].charts||[]).slice(0,3).forEach(chart=>appendResearchChart(host,chart)));break;}
     case'crawl-search':{const picks=[...document.querySelectorAll('[name="web-pick"]:checked')].map(el=>webResults.items[Number(el.value)].url);if(!picks.length){toast('先勾选要采集的网页');break;}crawlSeeds=picks.join('\n');S.researchTool='crawl';await renderResearchTool();break;}
     case'source-from-search':{const item=webResults.items[Number(id)];const sourceIndustry=S.industry,ticket=S.renderSeq,tool=S.toolSeq;const catalog=await api('/sources/'+sourceIndustry);if(S.industry!==sourceIndustry||ticket!==S.renderSeq||tool!==S.toolSeq)break;S.sources=catalog;S.sourceIndustry=sourceIndustry;sourceDialog();$('#source-form').elements.namedItem('name').value=item.title.slice(0,100);$('#source-form').elements.namedItem('url').value=item.url;$('#source-form').elements.namedItem('id').value='web-'+crypto.randomUUID().slice(0,8);break;}
     case'stop-crawl':await api('/crawls/'+id+'/stop','POST',{});toast('正在停止采集');break;
@@ -343,6 +655,8 @@ document.addEventListener('click',async e=>{try{
   }
 }catch(error){handleError(error);}});
 document.addEventListener('change',async e=>{try{
+  if(e.target.id==='material-select-all'){if(e.target.checked&&materialRecords.length>10){e.target.checked=false;toast('每批最多核验10份，请分别选择');return;}materialSelection=e.target.checked?new Set(materialRecords.map(materialKey)):new Set();document.querySelectorAll('[name="material-pick"]').forEach(b=>b.checked=e.target.checked);syncMaterialSelection();return;}
+  if(e.target.getAttribute('name')==='material-pick'){if(e.target.checked&&materialSelection.size>=10){e.target.checked=false;toast('每批最多核验10份');return;}if(e.target.checked)materialSelection.add(e.target.value);else materialSelection.delete(e.target.value);syncMaterialSelection();return;}
   if(e.target.name==='file'&&e.target.closest('#material-form')){const file=e.target.files[0],title=e.target.form.elements.namedItem('title');if(file&&!title.value.trim())title.value=file.name.replace(/\.[^.]+$/,'');return;}
   if(e.target.id==='industry-select'){S.industry=e.target.value;S.category='';S.q='';S.reviewOnly=false;materialKind='';webResults=null;crawlSeeds='';S.conversation=null;updateChatScope();await render();return;}
   if(e.target.id==='category-filter'){S.category=e.target.value;await render();return;}
@@ -365,6 +679,7 @@ document.addEventListener('submit',async e=>{e.preventDefault();
     if(formId==='library-search'){S.q=String(values.q||'').trim();await render();}
     if(formId==='memory-form'){await api('/memories','POST',{...values,model_allowed:form.elements.namedItem('model_allowed').checked});$('#dialog').close();await renderMemory();toast('记忆已保存');}
     if(formId==='material-form')await saveMaterialForm(form,values);
+    if(formId==='verification-decision-form')await submitVerificationDecisions(form,'approve');
     if(formId==='web-search-form'){const button=form.querySelector('[type="submit"]');button.disabled=true;button.textContent='搜索中…';const industry=S.industry,tool=++S.toolSeq;try{const result=await api('/network/search','POST',{industry,query:values.query,period:values.period||null,limit:Number(values.limit)});if(S.industry===industry&&tool===S.toolSeq&&S.view==='research'&&S.researchTool==='search'){webResults=result;webOptions={period:values.period,limit:Number(values.limit)};renderWebSearch();}}finally{if(button.isConnected){button.disabled=false;button.textContent='搜索网页';}}}
     if(formId==='crawl-form'){crawlSeeds=values.urls;crawlOptions={max_pages:Number(values.max_pages),max_depth:values.max_depth};const industry=S.industry,tool=S.toolSeq;const job=await api('/crawls','POST',{industry,urls:values.urls.split('\n').map(s=>s.trim()).filter(Boolean),max_pages:Number(values.max_pages),max_depth:Number(values.max_depth)});lastCrawlId=job.id;if(industry===S.industry&&tool===S.toolSeq&&S.view==='research'&&S.researchTool==='crawl')await renderCrawls();toast('采集任务已启动');}
     if(formId==='network-settings-form'){S.data.network=await api('/network/config','PUT',values);toast('搜索后端已保存');}

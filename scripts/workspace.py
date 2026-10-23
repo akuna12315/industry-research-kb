@@ -91,8 +91,20 @@ def records(root, entry, as_of=None):
     result = []
     for path in sorted((home / 'evidence').glob('*.json')):
         record = kb.read_json(path)
-        result.append({**record, 'industry_id': entry['id'], **freshness(record, settings, as_of),
-                       'path': path.with_suffix('.md').relative_to(root).as_posix()})
+        item = {**record, 'industry_id': entry['id'], **freshness(record, settings, as_of),
+                'path': path.with_suffix('.md').relative_to(root).as_posix()}
+        if record.get('source_kind') == 'local_material' or record.get('related_material'):
+            source = (record.get('material_source') if record.get('source_kind') == 'local_material' else record.get('related_material')) or {}
+            if not isinstance(source, dict):
+                source = {}
+            key = source.get('material_id', '')
+            material_path = home / 'materials' / (key + '.json') if re.fullmatch(r'[a-z0-9][a-z0-9_-]{2,79}', key) else None
+            changed = (material_path is None or not material_path.is_file()
+                       or not kb.material_source_current(kb.read_json(material_path), source))
+            item['source_version_changed'] = changed
+            if changed and item['freshness'] not in ('superseded', 'expired'):
+                item.update(freshness='review_due', freshness_label='原资料版本已变更，需重新核验')
+        result.append(item)
     return result
 
 
@@ -253,7 +265,8 @@ def brief(root, entries, args):
             f'- 资料适用地区：{record.get("region") or "未填写，须核对"}',
             f'- 事实状态：{kb.LABELS[record["status"]]}；时效：{record["freshness_label"]}',
             f'- 发布：{record.get("published_date") or "未明确"}；事件：{record.get("event_date") or "未明确"}；核验：{record["checked_date"]}；复核期限：{record["review_due_date"]}',
-            f'- [本地证据](../../{record["path"]}) · [原始来源]({record["url"]})',
+            (f'- [本地证据](../../{record["path"]}) · 本地资料 {record["material_source"]["material_id"]} / {record["material_source"]["citation"]}'
+             if record.get('source_kind') == 'local_material' else f'- [本地证据](../../{record["path"]}) · [原始来源]({record["url"]})'),
             f'- 适用范围与限制：{record.get("limitations") or "未填写，需补充"}', ''])
         if record.get('metrics'):
             lines.extend(['数字口径：', '', '```json', kb.json_text(record['metrics']).strip(), '```', ''])

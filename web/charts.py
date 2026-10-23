@@ -1,5 +1,6 @@
 """Bounded research figures backed by sources retrieved in the current turn."""
 from datetime import date, datetime
+import hashlib
 import math
 import re
 from typing import Literal
@@ -57,8 +58,12 @@ class ResearchChart(BaseModel):
 def _remember(ctx, kind, record, snippet=None):
     key = 'chart-' + ctx.chart_namespace + '-' + str(len(ctx.chart_sources) + 1)
     source = {k: record.get(k) for k in ('id', 'industry_id', 'title', 'url', 'checked_date',
-              'published_date', 'event_date', 'effective_date', 'status', 'region', 'metrics')}
+              'published_date', 'event_date', 'effective_date', 'status', 'region', 'metrics', 'source_kind', 'related_material')}
     source.update(kind=kind, ref=key, text=record.get('summary', '') if kind == 'evidence' else record.get('text', ''))
+    if kind == 'material':
+        source['retrieved_fingerprint'] = record.get('source_fingerprint') or kb.material_fingerprint(record)
+    elif kind == 'evidence':
+        source['retrieved_fingerprint'] = _evidence_fingerprint(record)
     if snippet:
         source.update(text=snippet['text'], citation=snippet['citation'], location=snippet.get('location', ''))
     for prior in ctx.chart_sources.values():
@@ -72,6 +77,11 @@ def _remember(ctx, kind, record, snippet=None):
 
 def register_evidence(ctx, records):
     return [{**r, 'chart_ref': _remember(ctx, 'evidence', r)} for r in records]
+
+
+def _evidence_fingerprint(record):
+    fields = ('title', 'summary', 'url', 'checked_date', 'status', 'metrics', 'material_source', 'related_material')
+    return hashlib.sha256(kb.json_text({key: record.get(key) for key in fields}).encode()).hexdigest()
 
 
 def register_materials(ctx, records):
@@ -100,6 +110,15 @@ def _source(ctx, ref):
                 raise ValueError('图表资料引用权限已撤回')
             if ctx.industry != 'all' and source['industry_id'] != ctx.industry and current.get('sensitivity') != 'public':
                 raise ValueError('共享资料需为公开且已授权资料')
+            if source.get('retrieved_fingerprint') != kb.material_fingerprint(current):
+                raise ValueError('原始资料版本已变化，请重新检索后绘图')
+        elif source.get('source_kind') == 'local_material' or source.get('related_material'):
+            current = next((r for r in ctx.store.evidence(source['industry_id'], limit=10**9)
+                            if r['id'] == source['id']), None)
+            if current is None or not ctx.store.evidence_model_allowed(current, ctx.industry):
+                raise ValueError('证据原始资料权限或版本已变化，请重新检索和核验')
+            if source.get('retrieved_fingerprint') != _evidence_fingerprint(current):
+                raise ValueError('证据版本已变化，请重新检索后绘图')
     else:
         page = ctx.pages.get(source.get('url'))
         if not page or not ctx.research:
