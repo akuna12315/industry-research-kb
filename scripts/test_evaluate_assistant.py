@@ -26,7 +26,7 @@ class EvaluationTests(unittest.TestCase):
         items = evaluation.load_questions(self.bank)
         self.assertEqual(len(items), 100)
         for item in items:
-            payload = evaluation.assistant_payload(item, 'forestry-jiangxi', 'separate-question')
+            payload = evaluation.assistant_payload(item, 'example', 'separate-question')
             self.assertEqual(payload['prompt'], item['q'])
             self.assertFalse(payload['research'])
             self.assertFalse(payload['allow_source_changes'])

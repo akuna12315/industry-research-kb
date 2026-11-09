@@ -124,6 +124,7 @@ class SimpleVerificationTests(Fixture, unittest.TestCase):
     def test_source_change_during_index_prevents_stale_index_commit(self):
         from .material_index import tokens
         review = self.review()
+        self.client.post(self.url(review), json={'decision': 'approve'})
         changed = False
         def change(text):
             nonlocal changed
@@ -132,9 +133,9 @@ class SimpleVerificationTests(Fixture, unittest.TestCase):
                 self.knowledge.save('alpha', {'id': 'local-plan', 'content': '新版原文另有计划。'})
             return tokens(text)
         with patch('web.material_index.tokens', side_effect=change):
-            response = self.client.post(self.url(review), json={'decision': 'approve'})
+            response = self.client.post('/api/materials/alpha/local-plan/index', json={})
         self.assertEqual(response.status_code, 400, response.text)
-        self.assertIsNone(self.app.state.material_index.latest('alpha', 'local-plan'))
+        self.assertEqual(self.app.state.material_index.latest('alpha', 'local-plan')['status'], 'invalidated')
         self.assertEqual(self.queue.get('alpha', review['id'])['status'], 'invalidated')
         self.assertEqual(len(self.store.evidence('alpha')), 1)
 

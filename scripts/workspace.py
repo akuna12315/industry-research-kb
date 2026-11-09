@@ -3,13 +3,13 @@
 This module never downloads sources or creates factual claims.
 """
 import argparse
+import hashlib
 from datetime import date, datetime, timedelta
 from pathlib import Path
 import re
 from urllib.parse import urlsplit
 
 import kb
-import professions
 
 DEFAULT_CATEGORIES = ['政策与监管', '企业与竞争', '产品与技术', '供应链', '市场与财务', '项目与事件', '风险', '背景与术语']
 FRESHNESS_LABELS = {'current': '未到复核期限', 'review_due': '待复核',
@@ -29,14 +29,22 @@ def registry(root):
             {'id': 'legacy', 'name': '原有知识库', 'path': '.', 'enabled': True}]}
     result = kb.read_json(path)
     entries = result.get('industries', [])
+    trash = result.get('deleted_industries', [])
+    if not isinstance(trash, list):
+        raise ValueError('行业回收站格式无效')
     ids = [safe_id(p['id']) for p in entries]
-    if len(set(ids)) != len(ids) or (result.get('active_industry') is not None and result['active_industry'] not in ids):
+    all_ids = ids + [safe_id(p['id']) for p in trash]
+    if len(set(all_ids)) != len(all_ids) or (result.get('active_industry') is not None and result['active_industry'] not in ids):
         raise ValueError('行业注册表含重复或未知标识')
-    for item in entries:
+    for item in entries + trash:
         if not isinstance(item.get('enabled'), bool):
             raise ValueError('行业 enabled 必须是布尔值')
         profile_path(root, item)
     return result
+
+
+def industry_token(entry):
+    return hashlib.sha256(kb.json_text(entry).encode('utf-8')).hexdigest()
 
 
 def profile_path(root, entry):
@@ -147,6 +155,17 @@ def find(root, entries, args, *, evidence_only=False):
     return sorted(results, key=lambda r: (-r['score'], r['path']))[:args.limit]
 
 
+def validate_regions(config):
+    values = config.get('research_regions', [config['primary_region']])
+    if not isinstance(values, list) or not values or len(values) > 20 or any(
+            not isinstance(r, str) or not r.strip() or len(r) > 100 for r in values):
+        raise ValueError('研究地区应为1至20个非空地区名称')
+    result = list(dict.fromkeys(r.strip() for r in values))
+    if config['primary_region'].strip() not in result:
+        raise ValueError('同时研究的地区须包含主要地区')
+    return result
+
+
 def validate_scope(config):
     for field in ('industry', 'primary_region'):
         if not isinstance(config.get(field), str) or not config[field].strip():
@@ -163,7 +182,7 @@ def validate_scope(config):
         if type(value) is not int or not 1 <= value <= 36500:
             raise ValueError('复核周期必须为1至36500天')
     if 'research_regions' in config:
-        config['research_regions'] = professions.regions(config)
+        config['research_regions'] = validate_regions(config)
     if not isinstance(config.get('comparison_regions', []), list) or any(not isinstance(r, str) or not r.strip() for r in config.get('comparison_regions', [])):
         raise ValueError('对照地区应为地区名称数组')
     return config
@@ -177,7 +196,7 @@ def industry_command(root, args):
         config = registry(root)
         if args.action == 'add':
             key = safe_id(args.id)
-            if any(p['id'] == key for p in config['industries']):
+            if any(p['id'] == key for p in config['industries'] + config.get('deleted_industries', [])):
                 raise ValueError('行业已存在；不会覆盖原档案')
             home = root / 'industries' / key
             if home.exists():
@@ -187,16 +206,11 @@ def industry_command(root, args):
                 'topics': args.categories or DEFAULT_CATEGORIES, 'lookback_days': 7,
                 'max_new_evidence_per_run': 12, 'weekly_deep_dive_day': 'Monday',
                 'freshness': {'default_days': 30, 'category_days': {}}})
-            forestry = getattr(args, 'specialty', None) == 'forestry'
-            if forestry:
-                settings.update(specialty='forestry', query_template='forestry-v1', research_regions=[args.region],
-                                topics=args.categories or professions.FORESTRY_TOPICS,
-                                freshness={'default_days': 30, 'category_days': {'技术标准': 90, '政策法规与规划': 60, '资源调查与空间资料': 365}})
             for folder in ('evidence', 'history', 'topics', 'reports/updates', 'reports/briefs', 'work', 'data'):
                 (home / folder).mkdir(parents=True, exist_ok=True)
             kb.atomic_write(home / 'config/scope.json', kb.json_text(settings))
-            kb.atomic_write(home / 'config/sources.json', kb.json_text(professions.national_sources() if forestry else {'sources': [], 'discovery_domains': [], 'mode': 'preferred'}))
-            kb.atomic_write(home / 'config/queries.json', kb.json_text(professions.forestry_queries(settings) if forestry else {category: [f'{args.name} {category} 官方'] for category in settings['topics']}))
+            kb.atomic_write(home / 'config/sources.json', kb.json_text({'sources': [], 'discovery_domains': [], 'mode': 'preferred'}))
+            kb.atomic_write(home / 'config/queries.json', kb.json_text({category: [f'{args.name} {category} 原文'] for category in settings['topics']}))
             kb.atomic_write(home / 'README.md', f'# {args.name}行业档案\n\n地区：{args.region}。尚无证据；信息来源待指定或公开发现。\n')
             for index, category in enumerate(settings['topics'], 1):
                 kb.atomic_write(home / f'topics/{index:02d}.md', f'# {category}\n\n尚无经核验资料。调查问题：关键事实、统计口径和原始来源是什么？\n')
@@ -210,6 +224,29 @@ def industry_command(root, args):
             if not entry:
                 raise ValueError('未知行业')
             entry['enabled'] = args.action == 'enable'
+        elif args.action in ('rename', 'delete', 'restore'):
+            trash = config.setdefault('deleted_industries', [])
+            origin = trash if args.action == 'restore' else config['industries']
+            entry = next((p for p in origin if p['id'] == args.id), None)
+            if entry is None:
+                raise ValueError('行业状态已变化，请刷新后重试')
+            if getattr(args, 'expected_token', None) and args.expected_token != industry_token(entry):
+                raise ValueError('行业状态已变化，请重新打开操作窗口')
+            if args.action == 'rename':
+                name = getattr(args, 'name', None)
+                if not isinstance(name, str) or not 1 <= len(name.strip()) <= 100 or any(c in name for c in '\r\n\x00'):
+                    raise ValueError('行业名称需为1至100字符')
+                entry['name'] = name.strip()
+                entry['management_revision'] = kb.uuid4().hex
+            elif args.action == 'delete':
+                config['industries'].remove(entry)
+                trash.append({**entry, 'enabled': False, 'deleted_at': kb.now(), 'deletion_id': kb.uuid4().hex})
+                if config.get('active_industry') == args.id:
+                    config['active_industry'] = None
+            else:
+                trash.remove(entry)
+                restored = {k: v for k, v in entry.items() if k not in ('deleted_at', 'deletion_id')}
+                config['industries'].append({**restored, 'enabled': False, 'management_revision': kb.uuid4().hex})
         kb.atomic_write(root / 'config/industries.json', kb.json_text(config))
     return config
 
@@ -409,9 +446,11 @@ def run_cli():
     create.add_argument('name')
     create.add_argument('--region', default='中国')
     create.add_argument('--categories', nargs='+')
-    create.add_argument('--specialty', choices=['forestry'])
-    for action in ('use', 'enable', 'disable'):
+    for action in ('use', 'enable', 'disable', 'delete', 'restore'):
         industry.add_parser(action).add_argument('id')
+    rename = industry.add_parser('rename')
+    rename.add_argument('id')
+    rename.add_argument('name')
     sources = commands.add_parser('source').add_subparsers(dest='action', required=True)
     sources.add_parser('list')
     create_source = sources.add_parser('add')
@@ -453,7 +492,6 @@ def run_cli():
                 if 'primary_region' in changes and 'research_regions' not in changes:
                     updated['research_regions'] = [changes['primary_region']]
                 updated = validate_scope(updated)
-                professions.sync_queries(home, old, updated, kb)
                 kb.atomic_write(home / 'config/scope.json', kb.json_text(updated))
             result = updated
         elif args.command == 'import':

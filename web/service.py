@@ -9,7 +9,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 import kb
 import workspace as ws
-import professions
 
 
 class Store:
@@ -37,24 +36,37 @@ class Store:
             home = ws.profile_path(self.root, entry)
             evidence = ws.records(self.root, entry)
             state = home / 'data/update-state.json'
-            entries.append({**entry, 'scope': ws.scope(home), 'evidence_count': len(evidence),
+            entries.append({**entry, **self.industry_counts(entry), 'management_token': ws.industry_token(entry),
+                'scope': ws.scope(home), 'evidence_count': len(evidence),
+                'material_count': sum(1 for _ in (home / 'materials').glob('*.json')),
                 'review_count': sum(r['freshness'] != 'current' for r in evidence),
                 'last_checked': max((r['checked_date'] for r in evidence), default=None),
                 'update_state': kb.read_json(state) if state.exists() else {}})
         return {'active_industry': registry.get('active_industry'), 'industries': entries,
+                'deleted_industries': [{**entry, **self.industry_counts(entry),
+                    'management_token': ws.industry_token(entry)} for entry in registry.get('deleted_industries', [])],
                 'as_of': datetime.now(kb.TZ).date().isoformat(),
                 'automation': kb.read_json(self.root / 'config/automation.json'),
                 'write_locked': (self.root / 'data/write.lock').exists()}
 
-    def research_entries(self, industry, include_shared=True):
-        entries = ws.selected(self.root, industry, many=True)
-        if industry != 'all' and include_shared:
-            settings = ws.scope(self.home(industry))
-            if settings.get('specialty') == 'forestry' and settings.get('library_role') != 'national-foundation':
-                entries += [e for e in ws.registry(self.root)['industries'] if e['id'] != industry
-                            and ws.scope(ws.profile_path(self.root, e)).get('library_role') == 'national-foundation'
-                            and ws.scope(ws.profile_path(self.root, e)).get('specialty') == 'forestry']
-        return entries
+    def industry_counts(self, entry):
+        home = ws.profile_path(self.root, entry)
+        pages = [kb.read_json(path) for path in (self.root / 'reports/pages').glob('*.json')]
+        drafts = [kb.read_json(path) for path in (self.root / 'reports/page-drafts').glob('*.json')]
+        return {'material_count': sum(1 for _ in (home / 'materials').glob('*.json')),
+                'evidence_count': sum(1 for _ in (home / 'evidence').glob('*.json')),
+                'page_count': sum(p.get('industry') == entry['id'] for p in pages),
+                'draft_count': sum(p.get('industry') == entry['id'] and p.get('status') != 'completed' for p in drafts)}
+
+    def industry_preview(self, industry):
+        entry = self.entry(industry)
+        config = ws.registry(self.root)
+        return {'id': entry['id'], 'name': entry['name'], 'management_token': ws.industry_token(entry),
+                'is_current': config.get('active_industry') == industry,
+                **self.industry_counts(entry)}
+
+    def research_entries(self, industry):
+        return ws.selected(self.root, industry, many=True)
 
     def evidence_model_allowed(self, record, industry='all'):
         source = record.get('material_source') if record.get('source_kind') == 'local_material' else record.get('related_material')
@@ -71,8 +83,8 @@ class Store:
                 and (industry == 'all' or record['industry_id'] == industry or material.get('sensitivity') == 'public')
                 and kb.material_source_current(material, source))
 
-    def evidence(self, industry='all', query='', include_shared=False, model_only=False, **filters):
-        entries = self.research_entries(industry, include_shared)
+    def evidence(self, industry='all', query='', model_only=False, **filters):
+        entries = self.research_entries(industry)
         args = self.args(**filters)
         requested_limit = args.limit
         if model_only:
@@ -133,7 +145,6 @@ class Store:
             if 'primary_region' in changes and 'research_regions' not in changes:
                 updated['research_regions'] = [changes['primary_region']]
             updated = ws.validate_scope(updated)
-            professions.sync_queries(home, old, updated, kb)
             kb.atomic_write(home / 'config/scope.json', kb.json_text(updated))
             for index, category in enumerate(updated['topics'], 1):
                 filename = f'{index:02d}-' + kb.hashlib.sha256(category.encode()).hexdigest()[:8] + '.md'
@@ -167,6 +178,13 @@ class Store:
 
     def read_document(self, path):
         target = (self.root / path).resolve()
+        for entry in ws.registry(self.root).get('deleted_industries', []):
+            home = ws.profile_path(self.root, entry)
+            retired = [home / name for name in ('evidence', 'topics', 'reports/updates')]
+            if home != self.root:
+                retired.append(home)
+            if any(target.is_relative_to(p.resolve()) for p in retired):
+                raise ValueError('该行业已移入回收站，请先恢复行业')
         allowed = [self.root / 'reports', self.root / 'topics', self.root / 'evidence']
         for entry in ws.registry(self.root)['industries']:
             home = ws.profile_path(self.root, entry)

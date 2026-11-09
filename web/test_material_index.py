@@ -67,6 +67,29 @@ class MaterialIndexTests(Fixture, unittest.TestCase):
         self.assertEqual(self.index.build('alpha', record['id'])['status'], 'completed')
         self.assertEqual(self.index.search('alpha', '赤松'), [])
 
+    def test_materials_outside_retrieval_stay_in_catalog_without_fulltext_search(self):
+        from fastapi.testclient import TestClient
+        from .server import create_app
+        record = self.material(model_allowed=False, sensitivity='restricted')
+        self.index.build('alpha', record['id'])
+        hits = self.index.search('alpha', '赤松密度', model_only=False)
+        self.assertEqual(hits, [])
+        self.assertEqual(self.index.search('alpha', '赤松密度'), [])
+        with TestClient(create_app(self.root)) as client:
+            response = client.get('/api/materials', params={'industry': 'alpha', 'q': '赤松密度'})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), [])
+            item = client.get('/api/materials', params={'industry':'alpha'}).json()[0]
+            self.assertFalse(item['model_allowed'])
+        self.assertEqual(self.store.state()['industries'][0]['material_count'], 1)
+
+    def test_local_library_search_does_not_reuse_excluded_text(self):
+        record = self.material(model_allowed=False)
+        self.index.build('alpha', record['id'])
+        self.knowledge.save('alpha', {'id': record['id'], 'content': '新版还未核验的独有正文'})
+        self.assertEqual(self.index.search('alpha', '赤松密度', model_only=False), [])
+        self.assertEqual(self.index.search('alpha', '独有正文', model_only=False), [])
+
     def test_model_rerank_only_reorders_exact_source_and_rechecks_permission(self):
         record = self.material()
         records = self.index.search('alpha', '普通内容')

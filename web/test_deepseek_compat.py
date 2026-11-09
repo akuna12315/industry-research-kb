@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import httpx
 from openai import AsyncOpenAI
-from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from .agent_runtime import AgentRuntime, configured_model, configured_model_settings, model_failure
@@ -146,6 +146,105 @@ class DeepSeekCompatibilityTests(Fixture, unittest.IsolatedAsyncioTestCase):
             result = await Agent(configured_model(cfg, client), output_type=MaterialRanking).run('rank',
                 model_settings=configured_model_settings(cfg, 1024))
         self.assertEqual(result.output.indices, [1, 0])
+
+    def responses_client(self, mode='valid'):
+        def respond(request):
+            body = json.loads(request.content)
+            self.requests.append(body)
+            self.assertEqual(request.url.path, '/responses')
+            if body.get('tool_choice') != 'auto':
+                return httpx.Response(400, json={'error': {
+                    'message': 'Thinking mode does not support this tool_choice synthetic-private-marker'}})
+            self.assertNotEqual((body.get('reasoning') or {}).get('effort'), 'none')
+            name = body['tools'][0]['name']
+            invalid = mode == 'invalid' or mode == 'retry' and len(self.requests) == 1
+            output = [{'type': 'reasoning', 'id': 'rs-synthetic', 'summary': [],
+                       'content': [{'type': 'reasoning_text', 'text': 'synthetic-reasoning'}]},
+                      {'type': 'function_call', 'id': 'fc-synthetic', 'call_id': 'call-synthetic',
+                       'name': name, 'arguments': json.dumps({'indices': [999] if invalid else [0]}),
+                       'status': 'completed'}]
+            if mode == 'text':
+                output = [{'type': 'message', 'id': 'msg-synthetic', 'role': 'assistant',
+                           'content': [{'type': 'output_text', 'text': '没有结构化排序', 'annotations': []}],
+                           'status': 'completed'}]
+            return httpx.Response(200, json={'id': 'resp-synthetic', 'object': 'response', 'created_at': 1,
+                'status': 'completed', 'model': 'deepseek-flash', 'output': output,
+                'usage': {'input_tokens': 20, 'output_tokens': 20, 'total_tokens': 40}})
+        return AsyncOpenAI(api_key='synthetic-test-key', base_url='https://api.deepseek.com', max_retries=0,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond)))
+
+    def responses_config(self):
+        self.runtime.save_config({'protocol': 'responses'}, secret='synthetic-test-key')
+        return self.runtime.config()
+
+    async def test_responses_old_profile_reproduces_forced_rerank_400(self):
+        self.responses_config()
+        records = self.knowledge.search('alpha', '营造林')
+        self.assertTrue(records)
+        async with self.responses_client() as client:
+            old_model = OpenAIResponsesModel('deepseek-flash', provider=OpenAIProvider(openai_client=client))
+            result = await self.runtime.rerank_materials('营造林', records, model_override=old_model, industry='alpha')
+        self.assertEqual(self.requests[0]['tool_choice'], 'required')
+        self.assertEqual(result[0]['ranking_method'], 'local_rank_fallback')
+        self.assertIn('思考模式不接受', result[0]['ranking_note'])
+        self.assertNotIn('synthetic-private-marker', result[0]['ranking_note'])
+
+    async def test_responses_configured_reranker_sends_auto_and_preserves_exact_sources(self):
+        cfg = self.responses_config()
+        records = self.knowledge.search('alpha', '营造林')
+        with patch('web.agent_runtime.AsyncOpenAI', return_value=self.responses_client()):
+            ranked = await self.runtime.rerank_materials('营造林', records, industry='alpha')
+        self.assertEqual(self.requests[0]['tool_choice'], 'auto')
+        self.assertEqual(ranked[0]['ranking_method'], 'model_rerank')
+        self.assertEqual(ranked[0]['snippets'][0]['text'], records[0]['snippets'][0]['text'])
+        self.assertEqual(ranked[0]['snippets'][0]['citation'], records[0]['snippets'][0]['citation'])
+        self.assertEqual(self.runtime.config(), cfg)
+        self.assertEqual(ranked[0]['ranking_usage']['requests'], 1)
+
+    async def test_responses_auto_does_not_accept_invalid_indices_or_plain_text_as_ranking(self):
+        self.responses_config()
+        records = self.knowledge.search('alpha', '营造林')
+        for mode in ('invalid', 'text'):
+            self.requests.clear()
+            with patch('web.agent_runtime.AsyncOpenAI', return_value=self.responses_client(mode)):
+                ranked = await self.runtime.rerank_materials('营造林', records, industry='alpha')
+            self.assertEqual(len(self.requests), 1)
+            self.assertEqual(self.requests[0]['tool_choice'], 'auto')
+            self.assertEqual(ranked[0]['ranking_method'], 'local_rank_fallback')
+            self.assertEqual(ranked[0]['snippets'][0]['text'], records[0]['snippets'][0]['text'])
+
+    async def test_responses_validation_retry_retains_reasoning_and_call_output_pair(self):
+        from pydantic_ai import Agent, ModelRetry
+        from .agent_runtime import MaterialRanking
+        cfg = self.responses_config()
+        async with self.responses_client('retry') as client:
+            model = configured_model(cfg, client)
+            self.assertIsInstance(model, OpenAIResponsesModel)
+            self.assertEqual(model.system, 'deepseek')
+            agent = Agent(model, output_type=MaterialRanking, retries=1)
+            @agent.output_validator
+            def valid(output):
+                if output.indices != [0]:
+                    raise ModelRetry('index超出输入范围')
+                return output
+            result = await agent.run('only candidate index 0')
+        self.assertEqual(result.output.indices, [0])
+        self.assertEqual(len(self.requests), 2)
+        history = self.requests[1]['input']
+        reasoning = next(i for i in history if i.get('type') == 'reasoning')
+        self.assertEqual(reasoning['content'][0]['text'], 'synthetic-reasoning')
+        calls = {i['call_id'] for i in history if i.get('type') == 'function_call'}
+        outputs = {i['call_id'] for i in history if i.get('type') == 'function_call_output'}
+        self.assertEqual(calls, outputs)
+        self.assertEqual(self.requests[1]['tool_choice'], 'auto')
+
+    async def test_responses_other_provider_profile_is_not_overridden(self):
+        cfg = {**self.runtime.config(), 'base_url': 'https://gateway.example/v1', 'protocol': 'responses'}
+        async with self.responses_client() as client:
+            model = configured_model(cfg, client)
+            self.assertIsInstance(model, OpenAIResponsesModel)
+            self.assertEqual(model.system, 'openai')
+            self.assertNotEqual(model.profile.get('supports_forced_tool_choice'), False)
 
 
 if __name__ == '__main__':

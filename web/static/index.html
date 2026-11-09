@@ -6,25 +6,30 @@
   <meta name="theme-color" content="#183e35">
   <title>研知 · 知识研究工作台</title>
   <meta name="description" content="在本机整理资料、检索证据、追溯来源，与研究助手一起开展调查。">
-  <link rel="stylesheet" href="/static/style.css?v=20261021-full-extraction-2">
+  <link rel="stylesheet" href="/static/style.css?v=20261106-ui-polish">
+  <link rel="stylesheet" href="/static/research-pages.css?v=20261107-page-recovery">
+  <link rel="stylesheet" href="/static/ui-polish.css?v=20261109-generic-kb">
+  <link rel="stylesheet" href="/static/visual-pages.css?v=20261109-page-prevention">
   <script src="/static/research-charts.js?v=20261020-verification" defer></script>
-  <script src="/static/app.js?v=20261021-fixed-chunks" defer></script>
+  <script src="/static/app.js?v=20261109-generic-kb" defer></script>
+  <script src="/static/visual-pages.js?v=20261107-thesis-layout" defer></script>
+  <script src="/static/research-pages.js?v=20261109-page-prevention" defer></script>
 </head>
 <body>
 <a class="skip-link" href="#content">跳到主要内容</a>
 <div class="app-shell">
   <main class="main">
     <header class="topbar">
-      <div class="topbar-left"><a class="brand" href="/" aria-label="研知首页"><span class="brand-icon" aria-hidden="true">✳</span><span class="brand-copy">研知</span></a><nav class="workspace-navigation" aria-label="主要导航"><button class="nav-item active" data-workspace="research" data-view="research">研究</button><button class="nav-item" data-workspace="library" data-view="materials">知识库</button></nav></div>
-      <div class="topbar-right"><span class="workspace-status"><span class="dot"></span>本机</span><label for="industry-select">当前档案</label><select id="industry-select" aria-label="当前档案"><option value="all">全部行业档案</option></select><button class="icon-button" id="refresh" title="刷新资料" aria-label="刷新资料">↻</button><button class="icon-button" data-workspace="settings" data-view="settings" title="设置" aria-label="设置">⚙</button></div>
+      <div class="topbar-left"><a class="brand" href="/" aria-label="研知首页"><span class="brand-icon" aria-hidden="true">✳</span><span class="brand-copy">研知</span></a><nav class="workspace-navigation" aria-label="主要导航"><button class="nav-item active" data-workspace="research" data-view="research">研究</button><button class="nav-item" data-workspace="library" data-view="materials">知识库</button><button class="nav-item" data-workspace="pages" data-view="pages">页面库</button></nav></div>
+      <div class="topbar-right"><span class="workspace-status"><span class="dot"></span>本机</span><label for="industry-select">当前行业</label><select id="industry-select" aria-label="当前行业" title="选择即保存，下次打开仍使用这个行业"><option value="all">全部行业</option></select><button class="industry-manage-link" id="industry-manager" aria-label="行业管理" title="管理、重命名或删除行业">管理</button><button class="icon-button" id="refresh" title="刷新资料" aria-label="刷新资料">↻</button><button class="icon-button" data-workspace="settings" data-view="settings" title="设置" aria-label="设置">⚙</button></div>
     </header>
     <div class="content" id="content" tabindex="-1" aria-live="polite"><div class="content-loading" role="status">正在连接本地知识库…</div></div>
     <footer class="main-footer"><span class="local-status"><span class="dot"></span>资料保存在本机<span id="server-date"></span></span><span>研知 · RESEARCH STUDIO</span></footer>
   </main>
   <div id="agent-parking" hidden><aside class="agent-panel" id="agent-panel" aria-label="研究助手">
     <div class="agent-header"><div class="agent-model"><span class="dot"></span><span id="model-name">正在读取模型配置…</span><button id="agent-settings" aria-label="打开模型设置">↗</button></div><button class="secondary" id="research-tools-toggle" type="button" aria-controls="research-tools-drawer" aria-expanded="false">研究工具</button><button id="new-chat" class="icon-button" title="新对话" aria-label="新对话">＋</button></div>
-    <div class="chat-log" id="chat-log"><div class="agent-welcome"><div class="welcome-spark" aria-hidden="true">✳</div><h2>每次研究，<br>从一个好问题开始。</h2><p>检索已有资料，比较不同来源，或带着明确问题开展新的调查。</p><button class="prompt-chip" data-prompt="检索当前档案的专业资料和证据，列出原始来源、版本、核验日期与资料缺口。">帮我梳理已有资料 <span>↗</span></button><button class="prompt-chip" data-prompt="哪些资料需要重新核验？说明事实状态和时效，列出原始来源。">哪些依据需要复核 <span>↗</span></button><button class="prompt-chip" data-prompt="为当前范围生成一份带来源、日期、比较口径和限制的证据简报。">整理一份证据简报 <span>↗</span></button></div></div>
-    <form id="chat-form" class="chat-compose"><div class="chat-mode"><label><input id="research-mode" type="checkbox">研究并归档</label><label class="source-permission"><input id="source-changes" type="checkbox">允许按我的要求添加信源</label><span id="chat-scope">全部档案 · 只读</span></div><textarea id="chat-input" rows="3" placeholder="提问，或说说你想研究什么…" aria-label="发给研究助手的问题"></textarea><div class="compose-bottom"><span>Enter 发送 · Shift + Enter 换行</span><button id="stop-agent" type="button" class="stop-button" hidden>停止</button><button id="send-agent" type="submit" class="send-button" aria-label="发送问题" title="发送问题"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="m22 2-7 20-4-9-9-4Z"></path><path d="M22 2 11 13"></path></svg></button></div></form>
+    <div class="chat-log" id="chat-log"><div class="agent-welcome"><div class="welcome-spark" aria-hidden="true">✳</div><h2>每次研究，<br>从一个好问题开始。</h2><p>检索已有资料，比较不同来源，或带着明确问题开展新的调查。</p><button class="prompt-chip" data-prompt="检索当前档案的专业资料，列出原始来源、版本、核验日期与资料缺口。">帮我梳理已有资料 <span>↗</span></button><button class="prompt-chip" data-prompt="哪些资料需要重新核验？说明事实状态和时效，列出原始来源。">哪些依据需要复核 <span>↗</span></button><button class="prompt-chip" data-prompt="检索当前范围的资料，整理一份带文档名、原文位置和引用片段的资料综述。">整理一份资料综述 <span>↗</span></button></div></div>
+    <form id="chat-form" class="chat-compose"><div class="chat-mode"><span id="chat-scope">全部行业</span><span class="chat-default-note">按需收录资料与信源，可直接说“不要归档”</span></div><textarea id="chat-input" rows="3" placeholder="提问，或说说你想研究什么…" aria-label="发给研究助手的问题"></textarea><div class="compose-bottom"><span>Enter 发送 · Shift + Enter 换行</span><button id="stop-agent" type="button" class="stop-button" hidden>停止</button><button id="send-agent" type="submit" class="send-button" aria-label="发送问题" title="发送问题"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="m22 2-7 20-4-9-9-4Z"></path><path d="M22 2 11 13"></path></svg></button></div></form>
   </aside></div>
 </div>
 <dialog id="dialog" aria-labelledby="dialog-title"><div class="dialog-header"><h2 id="dialog-title"></h2><button id="close-dialog" class="icon-button" aria-label="关闭">×</button></div><div id="dialog-body"></div></dialog>

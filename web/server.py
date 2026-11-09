@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 import json
 import os
+import sqlite3
 from pathlib import Path
 from typing import Literal
 
@@ -11,15 +12,17 @@ from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .service import Store, kb, ws
 from .agent_runtime import AgentRuntime
 from .network import NetworkRuntime
-from .knowledge import Knowledge, KINDS, STATES
+from .knowledge import Knowledge, KINDS, STATES, MAX_UPLOAD_BYTES
 from .verification import VerificationQueue
 from .full_extraction import FullExtractionRuntime
 from .material_index import MaterialIndex
+from .research_pages import ResearchPages
+from .page_recovery import PageDrafts
 
 WEB = Path(__file__).resolve().parent
 
@@ -31,7 +34,7 @@ class BodyLimit:
     async def __call__(self, scope, receive, send):
         if scope['type'] != 'http' or scope['method'] not in ('POST', 'PUT', 'PATCH'):
             return await self.app(scope, receive, send)
-        limit = 12_000_000 if scope['path'].startswith('/api/materials/') and scope['path'].endswith(('/upload', '/import')) else 1_000_000
+        limit = MAX_UPLOAD_BYTES + 2_000_000 if scope['path'].startswith('/api/materials/') and scope['path'].endswith(('/upload', '/import')) else 1_000_000
         chunks, size = [], 0
         while True:
             message = await receive()
@@ -55,20 +58,33 @@ class BodyLimit:
 
 
 class IndustryCreate(BaseModel):
+    model_config = ConfigDict(extra='forbid')
     id: str
     name: str = Field(min_length=1, max_length=100)
     region: str = Field(default='中国', min_length=1, max_length=100)
     categories: list[str] | None = None
-    specialty: Literal['forestry'] | None = None
 
 
 class AgentRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=12000)
     industry: str = 'all'
-    research: bool = False
+    research: bool = True
     conversation: str | None = None
-    allow_source_changes: bool = False
+    allow_source_changes: bool = True
     crawl_id: str | None = None
+    generate_page: bool = False
+    page_id: str | None = None
+    page_version: int | None = None
+    page_operation: Literal['create', 'layout', 'refresh'] = 'create'
+    page_scene_id: str | None = Field(default=None, pattern=r'^[a-zA-Z][a-zA-Z0-9_-]{0,47}$')
+    resume_draft_id: str | None = None
+    page_materials: list[dict[str, str]] = Field(default_factory=list, max_length=6)
+
+
+class IndustryManagement(BaseModel):
+    action: Literal['rename', 'delete', 'restore']
+    expected_token: str = Field(pattern=r'^[a-f0-9]{64}$')
+    name: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 def create_app(root=None):
@@ -79,12 +95,13 @@ def create_app(root=None):
     verifications = VerificationQueue(store)
     extractions = FullExtractionRuntime(store, runtime)
     material_index = MaterialIndex(store)
+    pages = ResearchPages(store)
     material_extraction_locks = {}
 
     @asynccontextmanager
     async def lifespan(app):
         # The old model extraction manifests are history only. Build a local
-        # fixed-size index for approved material, without any model requests.
+        # fixed-size index for opted-in material, without any model requests.
         await material_index.restore()
         yield
         await extractions.close()
@@ -103,6 +120,7 @@ def create_app(root=None):
     app.state.verifications = verifications
     app.state.extractions = extractions
     app.state.material_index = material_index
+    app.state.pages = pages
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=['127.0.0.1', 'localhost', '[::1]', 'testserver'])
     app.add_middleware(BodyLimit)
 
@@ -191,7 +209,7 @@ def create_app(root=None):
             return await extractions._transaction(verifications.decide, industry, key, payload)
         review = verifications.get(industry, key)
         if review['source']['kind'] != 'material':
-            result = await extractions._transaction(verifications.decide, industry, key, payload, {'extraction_method': 'model'})
+            result = await extractions._transaction(verifications.decide, industry, key, payload, {'extraction_method': 'local_index'})
             if result.get('material_id'):
                 indexed = await asyncio.to_thread(material_index.build, industry, result['material_id'])
                 return {**result, 'extraction_status': 'indexed', 'extraction_job': indexed}
@@ -237,12 +255,34 @@ def create_app(root=None):
 
     @app.get('/api/materials')
     def materials(industry: str = 'all', q: str = '', kind: str = ''):
+        matches = {(r['industry_id'], r['id']): r for r in material_index.search(
+            industry, q, limit=100, candidate_limit=120, model_only=False, kind=kind)} if q.strip() else {}
         return [{k: v for k, v in r.items() if k != 'content'} | {
-            'extraction_job': material_index.latest(r['industry_id'], r['id'])} for r in knowledge.list(industry, q, kind)]
+            'extraction_job': material_index.latest(r['industry_id'], r['id']),
+            'snippets': match['snippets'] if (match := matches.get((r['industry_id'], r['id'])))
+                and match['source_fingerprint'] == kb.material_fingerprint(r) else []} for r in knowledge.list(industry, q, kind)
+                if not q.strip() or r.get('model_allowed') and r.get('sensitivity') != 'restricted']
+
+    def indexed_material(record):
+        """Saving a source succeeds even if its local text cannot be indexed."""
+        result = {**record, 'extraction_job': None}
+        try:
+            result['extraction_job'] = material_index.latest(record['industry_id'], record['id'])
+            if record.get('model_allowed') and record.get('sensitivity') != 'restricted':
+                result['extraction_job'] = material_index.build(record['industry_id'], record['id'])
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            result['index_error'] = str(exc)
+        return result
 
     @app.post('/api/materials/{industry}')
     def material_save(industry: str, payload: dict):
-        return knowledge.save(industry, payload)
+        return indexed_material(knowledge.save(industry, payload))
+
+    @app.post('/api/materials/{industry}/{key}/retrieval')
+    def material_retrieval(industry: str, key: str, payload: dict):
+        if type(payload.get('enabled')) is not bool:
+            raise ValueError('加入检索开关需为布尔值')
+        return indexed_material(knowledge.save(industry, {'id': key, 'model_allowed': payload['enabled']}))
 
     @app.post('/api/materials/{industry}/import')
     async def material_import(industry: str, metadata: str = Form(...), file: UploadFile = File(...)):
@@ -255,9 +295,10 @@ def create_app(root=None):
                 raise ValueError('资料信息需为JSON对象') from None
             if not isinstance(payload, dict):
                 raise ValueError('资料信息需为JSON对象')
-            raw = await file.read(10_000_001)
+            raw = await file.read(MAX_UPLOAD_BYTES + 1)
             try:
-                return await asyncio.to_thread(knowledge.import_material, industry, payload, file.filename or 'document.txt', raw)
+                record = await asyncio.to_thread(knowledge.import_material, industry, payload, file.filename or 'document.txt', raw)
+                return await asyncio.to_thread(indexed_material, record)
             except (ValueError, OSError):
                 raise
             except Exception as exc:
@@ -271,10 +312,11 @@ def create_app(root=None):
 
     @app.post('/api/materials/{industry}/{key}/upload')
     async def material_upload(industry: str, key: str, file: UploadFile = File(...)):
-        raw = await file.read(10_000_001)
+        raw = await file.read(MAX_UPLOAD_BYTES + 1)
         await file.close()
         try:
-            return await asyncio.to_thread(knowledge.upload, industry, key, file.filename or 'document.txt', raw)
+            record = await asyncio.to_thread(knowledge.upload, industry, key, file.filename or 'document.txt', raw)
+            return await asyncio.to_thread(indexed_material, record)
         except ValueError:
             raise
         except Exception as exc:
@@ -340,11 +382,9 @@ def create_app(root=None):
 
     @app.get('/api/evidence')
     def evidence(industry: str = 'all', q: str = '', category: str | None = None, freshness: str | None = None,
-                 status: str | None = None, tag: str | None = None, source_id: str | None = None, review_only: bool = False,
-                 include_shared: bool = True):
+                 status: str | None = None, tag: str | None = None, source_id: str | None = None, review_only: bool = False):
         return store.evidence(industry, q, category=category or None, freshness=freshness or None,
-                              status=status or None, tag=tag or None, source_id=source_id or None, review_only=review_only, limit=100,
-                              include_shared=include_shared)
+                              status=status or None, tag=tag or None, source_id=source_id or None, review_only=review_only, limit=100)
 
     @app.get('/api/evidence/{industry}/{evidence_id}')
     def record(industry: str, evidence_id: str):
@@ -374,6 +414,20 @@ def create_app(root=None):
         if payload.get('active'):
             ws.industry_command(store.root, store.args(action='use', id=industry))
         return store.state()
+
+    @app.get('/api/industries/{industry}/deletion-preview')
+    def industry_deletion_preview(industry: str):
+        return store.industry_preview(industry)
+
+    @app.post('/api/industries/{industry}/manage')
+    async def industry_manage(industry: str, payload: IndustryManagement):
+        if payload.action == 'delete' and any(not task.done() for task in
+                [*runtime.tasks.values(), *network.tasks.values(), *extractions.tasks.values()]):
+            raise ValueError('仍有研究、采集或提取任务运行，请结束任务后再删除行业')
+        # Keep the busy check and registry transition in the same event-loop
+        # turn as Agent/crawl starts. No file trees are moved or removed.
+        return ws.industry_command(store.root,
+            store.args(id=industry, action=payload.action, name=payload.name, expected_token=payload.expected_token))
 
     @app.put('/api/active-industry')
     def active_update(payload: dict):
@@ -417,6 +471,22 @@ def create_app(root=None):
     def plan():
         return ws.update_plan(store.root)
 
+    @app.get('/api/pages')
+    def page_list(industry: str = 'all', q: str = '', region: str = '', tag: str = '', archived: bool = False, favorite: bool = False):
+        return pages.listing(industry, q, region, tag, archived, favorite)
+
+    @app.get('/api/page-drafts')
+    def page_drafts(industry: str = 'all'):
+        return PageDrafts(store).listing(industry)
+
+    @app.get('/api/pages/{page_id}')
+    def page_detail(page_id: str, revision: int | None = None):
+        return pages.detail(page_id, revision)
+
+    @app.post('/api/pages/{page_id}/{action}')
+    def page_action(page_id: str, action: Literal['metadata', 'copy', 'restore', 'delete'], payload: dict):
+        return pages.mutate(page_id, action, payload.get('version'), **{k: v for k, v in payload.items() if k != 'version'})
+
     @app.put('/api/agent/config')
     async def agent_config(payload: dict):
         secret = payload.pop('api_key', None)
@@ -429,13 +499,17 @@ def create_app(root=None):
     async def agent_test():
         try:
             return await runtime.test_connection()
+        except ValueError as exc:
+            return {'ok': False, 'message': str(exc)}
         except Exception as exc:
             return {'ok': False, 'message': type(exc).__name__ + '：连接未通过，请检查地址和后端服务。'}
 
     @app.post('/api/agent/jobs')
     async def agent_start(payload: AgentRequest):
         return runtime.start(payload.prompt, payload.industry, payload.research, payload.conversation,
-                             payload.allow_source_changes, payload.crawl_id)
+                             payload.allow_source_changes, payload.crawl_id, payload.generate_page,
+                             payload.page_id, payload.page_version, payload.page_operation, payload.page_scene_id,
+                             payload.resume_draft_id, payload.page_materials)
 
     @app.get('/api/agent/jobs/{job_id}')
     def job(job_id: str):
@@ -474,7 +548,8 @@ def create_app(root=None):
     return app
 
 
-app = create_app()
+# Installed applications keep writable libraries outside the program directory.
+app = create_app(os.environ.get('KB_LIBRARY_ROOT'))
 
 if __name__ == '__main__':
     import uvicorn

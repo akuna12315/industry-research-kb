@@ -77,18 +77,15 @@ class LocalEvidenceSourceTests(Fixture, unittest.TestCase):
         self.assertEqual(record['material_source']['quote'], self.material['content'])
         self.assertEqual(self.store.evidence('alpha', '造林计划', model_only=True), [])
 
-    def test_shared_internal_source_stays_out_of_regional_model_results(self):
-        for key, region in (('national', '全国'), ('local-region', '测试地区')):
-            ws.industry_command(self.root, self.store.args(action='add', id=key, name=key,
-                region=region, specialty='forestry', categories=None))
-        self.store.save_scope('national', {'library_role': 'national-foundation'})
-        material = self.knowledge.save('national', {'id': 'national-source', 'title': '内部全国方案',
-            'content': '全国基础造林计划。', 'model_allowed': True})
-        kb.import_records(self.store.home('national'), self.evidence_for(material))
-        self.assertEqual(len(self.store.evidence('local-region', include_shared=True)), 1)
-        self.assertEqual(self.store.evidence('local-region', include_shared=True, model_only=True), [])
-        self.knowledge.save('national', {'id': material['id'], 'sensitivity': 'public'})
-        self.assertEqual(len(self.store.evidence('local-region', include_shared=True, model_only=True)), 1)
+    def test_other_industry_is_not_implicitly_added_even_for_public_sources(self):
+        for key in ('reference','local-region'):
+            ws.industry_command(self.root,self.store.args(action='add',id=key,name=key,region='测试地区',categories=None))
+        material=self.knowledge.save('reference',{'id':'reference-source','title':'参考资料','content':'原文参数。','model_allowed':True})
+        kb.import_records(self.store.home('reference'),self.evidence_for(material))
+        self.assertEqual(self.store.evidence('local-region',model_only=True),[])
+        self.knowledge.save('reference',{'id':material['id'],'sensitivity':'public'})
+        self.assertEqual(self.store.evidence('local-region',model_only=True),[])
+        self.assertTrue(any(r['id']=='local-reference-source' for r in self.store.evidence('all',model_only=True)))
 
     def test_direct_web_import_cannot_skip_material_review(self):
         with self.assertRaisesRegex(ValueError, '资料核验入口'):

@@ -75,7 +75,7 @@ class MaterialIndex:
             result.update(status='invalidated', error='原文或资料版本已变化，请重建全文索引')
         return result
 
-    def build(self, industry, material_id, force=False, require_review=True):
+    def build(self, industry, material_id, force=False, require_review=False):
         record = self.knowledge.get(industry, material_id)
         if require_review and not self.approved(record):
             raise ValueError('请先通过当前资料版本的核验')
@@ -133,7 +133,7 @@ class MaterialIndex:
 
     async def restore(self):
         for record in await asyncio.to_thread(self.knowledge.list, 'all'):
-            if self.approved(record):
+            if record.get('model_allowed') and record.get('sensitivity') != 'restricted':
                 try:
                     await asyncio.to_thread(self.build, record['industry_id'], record['id'])
                 except (ValueError, OSError, sqlite3.Error):
@@ -141,15 +141,19 @@ class MaterialIndex:
                     # never fabricate a completed status for them.
                     continue
 
-    def search(self, industry, query, limit=8, candidate_limit=12, fuzzy=False):
+    def search(self, industry, query, limit=8, candidate_limit=12, fuzzy=False, model_only=True, kind='', material_scope=None):
         query_tokens = list(dict.fromkeys(tokens(query)))[:80]
         if not query_tokens:
             return []
-        records = self.knowledge.list(industry, '' if fuzzy else query, model_only=True)
+        records = self.knowledge.list(industry, '' if fuzzy else query, kind=kind, model_only=model_only)
+        if material_scope:
+            selected = {(r['industry_id'], r['id']) for r in material_scope}
+            records = [r for r in records if (r['industry_id'], r['id']) in selected]
+        records = [record for record in records if record.get('model_allowed') and record.get('sensitivity') != 'restricted']
         allowed = {(r['industry_id'], r['id']): r for r in records}
         for record in records:
             try:
-                self.build(record['industry_id'], record['id'], require_review=False)
+                self.build(record['industry_id'], record['id'])
             except (ValueError, OSError, sqlite3.Error):
                 continue
         hits = []
@@ -169,9 +173,10 @@ class MaterialIndex:
         for home, hit in hits:
             key = (home, hit['material_id'])
             record = self.knowledge.get(*key)
-            if (not record.get('model_allowed') or record.get('sensitivity') == 'restricted'
-                    or (industry != 'all' and home != industry and record.get('sensitivity') != 'public')
-                    or kb.material_fingerprint(record) != hit['fingerprint']):
+            if (kb.material_fingerprint(record) != hit['fingerprint']
+                    or (model_only and (not record.get('model_allowed') or record.get('sensitivity') == 'restricted'
+                        or (industry != 'all' and home != industry and record.get('sensitivity') != 'public')))
+                    or not record.get('model_allowed') or record.get('sensitivity') == 'restricted'):
                 continue
             if key not in grouped and len(grouped) >= limit:
                 continue

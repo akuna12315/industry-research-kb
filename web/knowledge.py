@@ -1,4 +1,4 @@
-"""Local professional materials, opt-in user memory and compact conversation history."""
+"""Local materials, opt-in user memory and compact conversation history."""
 from datetime import date, datetime
 import hashlib
 import io
@@ -11,9 +11,10 @@ from xml.etree import ElementTree as ET
 
 from .service import kb, ws
 
-KINDS = {'policy': '政策法规', 'plan': '规划', 'project': '项目方案', 'standard': '技术标准',
-         'dataset': '资源与空间资料', 'indicator': '社会经济指标', 'case': '成果案例', 'background': '专业知识'}
+KINDS = {'policy': '政策法规', 'plan': '规划与计划', 'project': '项目资料', 'standard': '标准文档',
+         'dataset': '数据资料', 'indicator': '统计指标', 'case': '案例材料', 'background': '参考资料'}
 STATES = {'unknown': '待核验', 'current': '现行/有效', 'upcoming': '尚未实施', 'obsolete': '已废止/被替代', 'draft': '草案/未批复'}
+MAX_UPLOAD_BYTES = 100_000_000
 
 
 def clean_text(value, maximum=200000):
@@ -179,9 +180,9 @@ class Knowledge:
                     records.append(self.display(record))
         return sorted(records, key=lambda r: r['updated_at'], reverse=True)
 
-    def search(self, industry, query, limit=8, fuzzy=False):
+    def search(self, industry, query, limit=8, fuzzy=False, material_scope=None):
         from .material_index import MaterialIndex
-        return MaterialIndex(self.store).search(industry, query, limit, fuzzy=fuzzy)
+        return MaterialIndex(self.store).search(industry, query, limit, fuzzy=fuzzy, material_scope=material_scope)
 
     def index_parts(self, record):
         relative=record.get('extraction',{}).get('text_index')
@@ -280,8 +281,8 @@ class Knowledge:
             record = {**self.get(industry, key), **metadata}
         suffix = Path(filename).suffix.lower()
         supported = ('.txt', '.md', '.csv', '.pdf', '.docx', '.png', '.jpg', '.jpeg', '.tif', '.tiff', '.geojson', '.zip')
-        if len(raw) > 10_000_000 or suffix not in supported:
-            raise ValueError('支持10MB以内文字文档、PDF、DOCX及常见图像/空间资料附件')
+        if len(raw) > MAX_UPLOAD_BYTES or suffix not in supported:
+            raise ValueError('支持100MB以内文字文档、PDF、DOCX及常见附件')
         if suffix=='.docx':
             scratch=self.store.root/'work'
             scratch.mkdir(parents=True,exist_ok=True)
@@ -334,7 +335,7 @@ class Knowledge:
             return self._save(industry, candidate,
                 attachment={'name': Path(filename).name, 'suffix': suffix, 'sha256': digest, 'storage_name': storage_name},
                 extraction={'characters': len(candidate['content']), 'sections': len(sections),
-                    'note': '仅管理原附件与元数据，未做OCR、解压或GIS空间计算。' if not sections else '未做OCR；扫描PDF可能没有可检索文字。' if suffix == '.pdf' else ''})
+                    'note': '仅保存原附件与元数据，未做OCR或附件内容分析。' if not sections else '未做OCR；扫描PDF可能没有可检索文字。' if suffix == '.pdf' else ''})
 
     def attachment(self, industry, key):
         record = self.get(industry, key)
@@ -348,9 +349,10 @@ class Knowledge:
 
     def memories(self, industry, model_only=False):
         ws.selected(self.store.root, industry, many=True)
+        allowed = {'all', *[e['id'] for e in ws.registry(self.store.root)['industries']]}
         path = self.store.root / 'data/user-memory.json'
         records = kb.read_json(path) if path.exists() else []
-        return [r for r in records if not r.get('archived') and (industry == 'all' or r['industry'] in ('all', industry))
+        return [r for r in records if r['industry'] in allowed and not r.get('archived') and (industry == 'all' or r['industry'] in ('all', industry))
                 and (not model_only or r.get('model_allowed'))]
 
     def save_memory(self, payload):
@@ -407,5 +409,6 @@ class Knowledge:
 
     def conversations(self, industry):
         ws.selected(self.store.root, industry, many=True)
+        allowed = {'all', *[e['id'] for e in ws.registry(self.store.root)['industries']]}
         records = [kb.read_json(p) for p in (self.store.root / 'data/conversations').glob('*.json')]
-        return sorted([r for r in records if industry == 'all' or r['industry'] == industry], key=lambda r: r['updated_at'], reverse=True)[:50]
+        return sorted([r for r in records if r['industry'] in allowed and (industry == 'all' or r['industry'] == industry)], key=lambda r: r['updated_at'], reverse=True)[:50]

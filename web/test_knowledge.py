@@ -158,12 +158,28 @@ class KnowledgeTests(Fixture, unittest.TestCase):
         self.assertEqual(history[0]['version'],'v1')
 
     def test_atomic_import_file_size_checks_attachment_without_counting_multipart_overhead(self):
-        response=self.import_file({'id':'atomic-too-large','title':'超过上传限额'},'large.tif',b'x'*10_000_001)
+        response=self.import_file({'id':'atomic-too-large','title':'超过上传限额'},'large.tif',b'x'*100_000_001)
         self.assertEqual(response.status_code,400,response.text)
         self.assert_import_absent('atomic-too-large')
-        response=self.import_file({'id':'atomic-at-limit','title':'恰好上传限额'},'limit.tif',b'x'*10_000_000)
+        response=self.import_file({'id':'atomic-at-limit','title':'恰好上传限额'},'limit.tif',b'x'*100_000_000)
         self.assertEqual(response.status_code,200,response.text)
         self.assertIn('未做OCR',response.json()['extraction']['note'])
+        path, _ = self.knowledge.attachment('alpha', 'atomic-at-limit')
+        self.assertEqual(path.stat().st_size, 100_000_000)
+        self.assertEqual(response.json()['attachment']['sha256'], hashlib.sha256(b'x'*100_000_000).hexdigest())
+
+    def test_existing_material_attachment_upload_accepts_100mb_and_rejects_larger(self):
+        record = self.material(id='large-attachment')
+        endpoint = '/api/materials/alpha/' + record['id'] + '/upload'
+        response = self.client.post(endpoint, files={'file': ('limit.tif', b'x'*100_000_000)})
+        self.assertEqual(response.status_code, 200, response.text)
+        path, _ = self.knowledge.attachment('alpha', record['id'])
+        self.assertEqual(path.stat().st_size, 100_000_000)
+        before = self.knowledge.get('alpha', record['id'])
+        response = self.client.post(endpoint, files={'file': ('large.tif', b'x'*100_000_001)})
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn('100MB', response.json()['detail'])
+        self.assertEqual(self.knowledge.get('alpha', record['id']), before)
 
     def test_atomic_import_rejects_invalid_json_and_top_level_arrays(self):
         for serialized in ('{', '[]', '[{"title":"不能以数组导入"}]', 'null', 'true', '"string"'):

@@ -24,3 +24,12 @@ __pycache__/
 *.db
 .DS_Store
 outputs/
+
+# Local builds and dependency tooling
+dist/
+build/
+node_modules/
+*.exe
+*.dll
+*.pyd
+*.zip

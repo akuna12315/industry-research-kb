@@ -139,11 +139,11 @@ class FullExtractionTests(Fixture, unittest.IsolatedAsyncioTestCase):
     async def test_revoked_permission_during_request_blocks_commit(self):
         self.jobs.model_override = object()
         async def revoke(runtime, material, batch, **kwargs):
-            self.knowledge.save('alpha', {'id': 'long-plan', 'model_allowed': False})
+            await self.jobs._transaction(self.knowledge.save, 'alpha', {'id': 'long-plan', 'model_allowed': False})
             return await self.extract(runtime, material, batch)
         with patch('web.full_extraction.extract_batch', side_effect=revoke):
             job = await self.wait(await self.jobs.create('alpha', 'long-plan'))
-        self.assertEqual(job['status'], 'waiting_permission')
+        self.assertEqual(job['status'], 'waiting_permission', job)
         self.assertEqual(job['evidence_ids'], [])
         self.assertEqual(len(self.store.evidence('alpha')), 1)
 
@@ -217,8 +217,10 @@ class FullExtractionAPITests(Fixture, unittest.TestCase):
         self.assertEqual(again.status_code, 200)
         self.assertEqual(len(self.store.evidence('alpha')), 1)
 
-    def test_unapproved_material_cannot_start_or_cross_site_write(self):
+    def test_unapproved_material_can_index_but_cross_site_writes_stay_blocked(self):
         result = self.client.post('/api/materials/alpha/local-plan/extractions', json={'restart': True})
-        self.assertEqual(result.status_code, 400)
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json()['usage']['requests'], 0)
+        self.assertEqual(len(self.store.evidence('alpha')), 1)
         result = self.client.post('/api/materials/alpha/local-plan/extractions', json={'restart': True}, headers={'Origin': 'https://evil.example'})
         self.assertEqual(result.status_code, 403)

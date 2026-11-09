@@ -65,7 +65,7 @@ class ChartTests(Fixture, unittest.TestCase):
 
     def test_other_archive_reference_is_rejected(self):
         self.ctx.chart_sources[self.ref]['industry_id'] = 'unselected'
-        with self.assertRaisesRegex(ValueError, '档案'):
+        with self.assertRaisesRegex(ValueError, '行业'):
             validate_chart(self.ctx, self.timeline(date='2025'))
 
     def test_finite_values_calendar_and_size_limits(self):

@@ -343,7 +343,7 @@ class AgentTests(Fixture, unittest.IsolatedAsyncioTestCase):
         job = await self.run_model(model)
         self.assertEqual(job['status'], 'completed', job['events'])
 
-    async def test_research_reads_original_then_requests_user_verification(self):
+    async def test_research_reads_original_then_saves_unverified_searchable_material(self):
         calls = 0
         def model(messages, info):
             nonlocal calls
@@ -354,27 +354,30 @@ class AgentTests(Fixture, unittest.IsolatedAsyncioTestCase):
                 return ModelResponse(parts=[ToolCallPart('archive_evidence', {'record': {**self.record,
                     'id': 'read-then-reviewed', 'quote': '企业披露合同'}}, tool_call_id='archive-after-read')])
             returned = [part for message in messages for part in message.parts if isinstance(part, ToolReturnPart)]
-            self.assertEqual(returned[-1].content['status'], 'pending')
-            self.assertIn('不得声称已归档', returned[-1].content['message'])
-            return ModelResponse(parts=[TextPart('原文已读，等待您确认：是否通过核验并入库？')])
+            self.assertEqual(returned[-1].content['status'], 'saved')
+            self.assertEqual(returned[-1].content['index_status'], 'completed')
+            return ModelResponse(parts=[TextPart('原文已读，已收录为未核验资料并加入检索。')])
         page = {'url': self.record['url'], 'requested_url': self.record['url'], 'title': '测试合同原文',
                 'text': '企业披露合同', 'links': [], 'truncated': False, 'checked_date': self.record['checked_date']}
         with patch('web.agent_runtime.fetch_page', new=AsyncMock(return_value=page)):
             job = await self.run_model(model, research=True)
         self.assertEqual(job['status'], 'completed', job['events'])
         self.assertFalse((self.store.home('alpha') / 'evidence/read-then-reviewed.json').exists())
-        event = next(event for event in job['events'] if event['type'] == 'verification_required')
+        event = next(event for event in job['events'] if event['type'] == 'material_saved')
         from .verification import VerificationQueue
-        review = VerificationQueue(self.store).get('alpha', event['id'])
-        self.assertEqual(review['status'], 'pending')
-        self.assertEqual(review['source']['checked_date'], self.record['checked_date'])
-        self.assertEqual(review['candidates'][0]['status'], 'reported')
+        from .knowledge import Knowledge
+        self.assertEqual(VerificationQueue(self.store).list('alpha'), [])
+        material = Knowledge(self.store).get('alpha', event['id'])
+        self.assertEqual(material['content'], page['text'])
+        self.assertNotIn('verification', material)
+        self.assertIsNone(material['checked_date'])
+        self.assertTrue(material['model_allowed'])
         self.assertFalse(any(event['type'] == 'archived' for event in job['events']))
-        self.assertEqual(job['events'][-1]['archived_ids'], [])
-        self.assertEqual(job['events'][-1]['pending_review_ids'], [review['id']])
+        self.assertEqual(job['events'][-1]['archived_ids'], [material['id']])
+        self.assertEqual(job['events'][-1]['pending_review_ids'], [])
         note = kb.read_json(self.root / 'reports/agent-runs' / (job['id'] + '.json'))
-        self.assertEqual(note['pending_review_ids'], [review['id']])
-        self.assertEqual(note['archived_ids'], [])
+        self.assertEqual(note['pending_review_ids'], [])
+        self.assertEqual(note['archived_ids'], [material['id']])
 
 
 if __name__ == '__main__':

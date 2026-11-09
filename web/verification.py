@@ -126,7 +126,7 @@ class VerificationQueue:
                 'fingerprint': context['fingerprint'], 'prepared_at': review['created_at']})
             return review
 
-    def prepare_web(self, industry, record, page):
+    def prepare_web(self, industry, record, page, persist=True):
         self.store.entry(industry)
         record = {key: value for key, value in record.items() if key in (
             'id', 'title', 'summary', 'url', 'publisher', 'region', 'category', 'status', 'tags',
@@ -156,6 +156,8 @@ class VerificationQueue:
             'excerpts': excerpts, 'candidates': candidates, 'findings': ['公开原文已读取，事实草稿需由用户确认后才入库。'],
             'coverage_note': '仅保留支持候选的短摘录；来源声称不等于已交叉确认。', 'created_at': kb.now(),
             'web_record': clean}
+        if not persist:
+            return review
         with kb.lock(self.store.root):
             return self._write(industry, review)
 
@@ -199,7 +201,7 @@ class VerificationQueue:
         if status not in ('', 'all', 'pending', 'approved', 'rejected', 'invalidated'):
             raise ValueError('核验状态无效')
         results = []
-        for entry in self.store.research_entries(industry, include_shared=True):
+        for entry in self.store.research_entries(industry):
             for path in self.folder(entry['id']).glob('*.json'):
                 review = self._project(entry['id'], kb.read_json(path))
                 if status in ('', 'all') or review['status'] == status:
@@ -353,8 +355,9 @@ class VerificationQueue:
                 record = self.knowledge._save(industry, web_material, validate_only=True)
                 if same_public_version:
                     record['related_evidence_ids'] = existing_material.get('related_evidence_ids', [])
+            index_only = bool(analysis and analysis.get('extraction_method') == 'local_index')
             records = []
-            for index, candidate in enumerate(candidates):
+            for index, candidate in enumerate([] if index_only else candidates):
                 if local_source:
                     identity = '\n'.join((industry, record['id'], candidate['citation'], candidate['title']))
                     evidence_id = 'local-' + hashlib.sha256(identity.encode()).hexdigest()[:32]
@@ -391,7 +394,7 @@ class VerificationQueue:
             ids = [item['id'] for item in records]
             result = {**review, 'status': 'approved', 'decision_note': note or review.get('decision_note', ''),
                 'decided_at': review.get('decided_at') or kb.now(), 'material_verified': True,
-                'extraction_status': 'completed', 'extraction_finished_at': kb.now(),
+                'extraction_status': 'pending' if index_only else 'completed', 'extraction_finished_at': kb.now(),
                 'candidates': candidates, 'evidence_ids': ids}
             result.pop('extraction_error', None)
             if not local_source:
@@ -406,7 +409,7 @@ class VerificationQueue:
                 updated = {**record, 'related_evidence_ids': list(dict.fromkeys(record.get('related_evidence_ids', []) + ids))}
                 verification = {'status': 'reviewed', 'review_id': review['id'], 'fingerprint': kb.material_fingerprint(record),
                     'reviewed_at': result['decided_at'], 'evidence_ids': ids, 'note': result['decision_note'],
-                    'extraction_status': 'completed'}
+                    'extraction_status': 'pending' if index_only else 'completed'}
                 if result.get('extraction_method'):
                     verification['extraction_method'] = result['extraction_method']
                 if not local_source:
@@ -422,7 +425,8 @@ class VerificationQueue:
             try:
                 if web_material is not None:
                     self.knowledge._save(industry, web_material)
-                kb.import_records(home, records, already_locked=True)
+                if records:
+                    kb.import_records(home, records, already_locked=True)
                 if record:
                     self.knowledge._save(industry, updated, verification=verification)
                 self._write(industry, result)

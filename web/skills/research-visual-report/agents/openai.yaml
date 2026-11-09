@@ -1,0 +1,4 @@
+interface:
+  display_name: "研究可视化报告"
+  short_description: "将研究内容整理成带引用的图表、表格与交互网页，按数据选择表达方式"
+  default_prompt: "使用 $research-visual-report 将这些研究内容整理成可视化报告，合理选择图表、表格并保留来源。"

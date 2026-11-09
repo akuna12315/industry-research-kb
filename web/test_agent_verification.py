@@ -181,13 +181,13 @@ class WebDraftAgentTests(Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job['status'], 'completed', job['events'])
         return job
 
-    async def test_pending_new_facts_obey_limit_without_importing(self):
+    async def test_repeated_source_counts_once_without_creating_facts(self):
         scope_path = self.store.home('alpha') / 'config/scope.json'
         kb.atomic_write(scope_path, kb.json_text({**kb.read_json(scope_path), 'max_new_evidence_per_run': 1}))
         job = await self.run_script([{**self.record, 'id': f'pending-{index}', 'quote': '企业披露合同'} for index in range(2)])
-        self.assertEqual(len(VerificationQueue(self.store).list('alpha')), 1)
-        self.assertEqual(len(job['events'][-1]['pending_review_ids']), 1)
-        self.assertEqual(job['events'][-1]['archived_ids'], [])
+        self.assertEqual(len(VerificationQueue(self.store).list('alpha')), 0)
+        self.assertEqual(job['events'][-1]['pending_review_ids'], [])
+        self.assertEqual(len(job['events'][-1]['archived_ids']), 1)
         self.assertEqual(len(self.store.evidence('alpha')), 1)
 
     async def test_missing_quote_and_readonly_mode_do_not_prepare_review(self):

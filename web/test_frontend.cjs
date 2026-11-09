@@ -8,6 +8,8 @@ const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, 'static', 'app.js'), 'utf8');
 const chartSource = fs.readFileSync(path.join(__dirname, 'static', 'research-charts.js'), 'utf8');
+const pageSource = fs.readFileSync(path.join(__dirname, 'static', 'research-pages.js'), 'utf8');
+const visualSource = fs.readFileSync(path.join(__dirname, 'static', 'visual-pages.js'), 'utf8');
 const html = fs.readFileSync(path.join(__dirname, 'static', 'index.html'), 'utf8');
 const clone = value => structuredClone(value);
 const decode = value => value.replace(/&(?:amp|lt|gt|quot|#39);/g, token => ({
@@ -216,6 +218,8 @@ class OfflineFormData {
     }
   }
   append(name, value) { this.values.push([name, value]); }
+  get(name) { return this.values.find(pair => pair[0] === name)?.[1] ?? null; }
+  has(name) { return this.values.some(pair => pair[0] === name); }
   [Symbol.iterator]() { return this.values[Symbol.iterator](); }
 }
 
@@ -246,8 +250,9 @@ async function harness(evaluatedSource = source) {
   const h = {document, calls, streams, errors, timers, state, handler: null};
   const fallback = request => {
     if (request.path === '/api/state') return clone(state);
+    if (request.path === '/api/active-industry' && request.method === 'PUT') {state.active_industry=request.body.id;return clone(state);}
     if (request.path.startsWith('/api/sources/')) return {mode: 'preferred', sources: []};
-    if (['/api/materials', '/api/evidence', '/api/reports', '/api/memories', '/api/conversations', '/api/crawls', '/api/verifications'].includes(request.path)) return [];
+    if (['/api/materials', '/api/evidence', '/api/reports', '/api/memories', '/api/conversations', '/api/crawls', '/api/verifications', '/api/pages', '/api/page-drafts'].includes(request.path)) return [];
     throw new Error('Unmocked request: ' + request.method + ' ' + request.url);
   };
   class OfflineEventSource {
@@ -271,7 +276,7 @@ async function harness(evaluatedSource = source) {
       return {ok: true, status: 200, json: async () => clone(value)};
     }
   });
-  vm.runInContext(chartSource + '\n' + evaluatedSource + '\n;globalThis.__frontend = {S, render, renderSources, sourceDialog, materialDialog, sendAgent, refresh, esc, safeURL, markdown};', context, {filename: 'app.js'});
+  vm.runInContext(chartSource + '\n' + evaluatedSource + '\n' + visualSource + '\n' + pageSource + '\n;globalThis.__frontend = {S, P, render, renderSources, sourceDialog, materialDialog, sendAgent, refresh, esc, safeURL, markdown, renderPages, openResearchPage, pageComposer, pageCommand};', context, {filename: 'app.js'});
   h.app = context.__frontend;
   // Initial refresh is the production boot path; wait for its finite microtasks.
   for (let index = 0; index < 20; ++index) await Promise.resolve();
@@ -305,6 +310,26 @@ function assertNoMarkupInjection(container) {
   visit(container);
 }
 
+test('blank first-run state has no model or industry presets in settings', async () => {
+  const h = await harness();
+  h.state.active_industry = null;
+  h.state.industries = [];
+  h.state.automation = {status: 'PAUSED'};
+  Object.assign(h.state.agent, {provider_id: '', display_name: '', base_url: '', model: '', key_configured: false, configured: false});
+  h.app.S.industry = 'all';
+  await h.app.refresh();
+  assert.equal(h.document.querySelector('#model-name').textContent, '未配置模型');
+  h.app.S.view = 'settings';
+  await h.app.render();
+  for (const name of ['provider_id', 'display_name', 'base_url', 'model']) {
+    assert.equal(h.document.querySelector('#settings-form').elements.namedItem(name).value, '');
+  }
+  assert.ok(h.document.querySelector('#settings-archives').textContent.includes('创建第一个研究行业'));
+  assert.ok(h.document.querySelector('#settings-model').textContent.includes('尚未配置定时任务'));
+  assert.ok(!h.document.querySelector('#settings-model').innerHTML.includes('8091'));
+  assert.equal(h.errors.length, 0);
+});
+
 test('DOM moves detach the old parent and replaced children become disconnected', async () => {
   const document = new Document('<body><div id="one"><div id="moving"></div></div><div id="two"></div></body>');
   const one = document.querySelector('#one'), two = document.querySelector('#two'), moving = document.querySelector('#moving');
@@ -317,19 +342,19 @@ test('DOM moves detach the old parent and replaced children become disconnected'
   assert.equal(moving.isConnected, false);
 });
 
-test('three primary destinations and all startup bindings exist once', async () => {
+test('four primary destinations and all startup bindings exist once', async () => {
   const h = await harness();
   const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map(match => match[1]);
   assert.equal(new Set(ids).size, ids.length, 'static HTML must not contain duplicate IDs');
   const bound = [...source.matchAll(/^\$\('#([^']+)'\)\.(?:addEventListener|onclick)/gm)].map(match => match[1]);
-  for (const id of new Set([...bound, 'content', 'server-date', 'model-name', 'dialog', 'dialog-title', 'dialog-body', 'toast', 'research-mode', 'source-changes', 'chat-scope', 'agent-panel', 'agent-parking'])) {
+  for (const id of new Set([...bound, 'content', 'server-date', 'model-name', 'dialog', 'dialog-title', 'dialog-body', 'toast', 'chat-scope', 'agent-panel', 'agent-parking'])) {
     assert.ok(ids.includes(id), 'missing static initialization element: ' + id);
   }
   const primary = h.document.querySelector('.topbar').querySelectorAll('[data-workspace]').map(node => node.dataset.workspace);
-  assert.deepEqual(primary.sort(), ['library', 'research', 'settings']);
+  assert.deepEqual(primary.sort(), ['library', 'pages', 'research', 'settings']);
   assert.equal(h.app.S.view, 'research');
-  assert.equal(h.document.querySelector('#research-mode').checked, false);
-  assert.equal(h.document.querySelector('#source-changes').checked, false);
+  assert.equal(h.document.querySelector('#research-mode'), null);
+  assert.equal(h.document.querySelector('#source-changes'), null);
   assert.ok(h.calls.every(call => call.url.startsWith('/api/')));
 });
 
@@ -474,7 +499,7 @@ test('changing industry invalidates closed drawer context instead of reusing old
   assert.equal(h.errors.length, 0);
 });
 
-test('materials show returned local/shared entries and escape titles/IDs', async () => {
+test('materials show returned entries and escape titles/IDs', async () => {
   const h = await harness();
   h.app.S.view = 'materials';
   const payload = '\"><img src=x onerror=alert(1)> &';
@@ -488,8 +513,6 @@ test('materials show returned local/shared entries and escape titles/IDs', async
   assert.equal(buttons[1].dataset.industry, 'national');
   assert.ok(content.innerHTML.includes(h.app.esc(payload)));
   assertNoMarkupInjection(content);
-  const count = h.document.querySelector('#nav-count');
-  if (count) assert.equal(String(count.textContent), '12', 'shared national evidence is included once');
   assert.equal(h.calls.at(-1).query.get('industry'), 'alpha');
 });
 
@@ -548,15 +571,18 @@ function figure(kind='timeline') {
   return {kind,title:'年度面积变化',metric:'面积',unit:'公顷',geography:'测试地区',scope:'示范林',basis:'年度实际完成',nature:'actual',items:[{...point,label:'2023',date:'2023',value:0},{...point,label:'2024',date:'2024',value:null},{...point,label:'2025',date:'2025',value:12.5}]};
 }
 
-test('library has only materials and evidence; old timeline view returns to research', async () => {
+test('library has one material entry and old evidence navigation returns to materials', async () => {
   const h=await harness();h.app.S.view='materials';await h.app.render();
-  const tabs=h.document.querySelector('.library-switch').querySelectorAll('button');
-  assert.deepEqual(tabs.map(b=>b.textContent),['资料','知识证据']);
-  assert.equal(h.document.querySelector('[data-view="timeline"]'),null);
-  h.app.S.view='timeline';await h.app.render();
-  assert.equal(h.app.S.view,'research');
+  assert.equal(h.document.querySelector('[data-view="evidence"]'),null);
+  assert.equal(h.document.querySelector('[data-action="manual-evidence"]'),null);
+  assert.match(h.document.querySelector('#content').textContent,/直接选择是否加入检索/);
+  assert.doesNotMatch(h.document.querySelector('#content').textContent,/知识证据/);
+  h.app.S.view='evidence';await h.app.render();assert.equal(h.app.S.view,'materials');
+  assert.equal(h.calls.filter(c=>c.path==='/api/evidence').length,0);
+  h.app.S.view='timeline';await h.app.render();assert.equal(h.app.S.view,'research');
   assert.equal(h.document.querySelector('#agent-panel').parentElement.id,'research-agent-slot');
 });
+
 
 test('sourced timeline streams once while parked, survives navigation and opens references', async () => {
   const h=await harness();h.handler=(request,fallback)=>request.path==='/api/agent/jobs'?{id:'figure-job',conversation:'figure-conversation'}:fallback(request);
@@ -645,23 +671,19 @@ test('late material response cannot show the previous industry', async () => {
   assert.equal(h.app.S.industry, 'beta');
 });
 
-test('review is an evidence filter with review_only parameter, not a page', async () => {
-  const h = await harness();
-  h.app.S.view = 'evidence';
-  await h.app.render();
-  const checkbox = h.document.querySelector('#review-only');
-  assert.ok(checkbox, 'review-only checkbox belongs to evidence');
-  checkbox.checked = true;
-  await h.document.dispatch('change', checkbox);
-  assert.equal(h.app.S.reviewOnly, true);
-  assert.equal(h.app.S.view, 'evidence');
-  assert.equal(h.calls.filter(call => call.path === '/api/evidence').at(-1).query.get('review_only'), 'true');
-  const updated = h.document.querySelector('#review-only');
-  updated.checked = false;
-  await h.document.dispatch('change', updated);
-  assert.equal(h.calls.filter(call => call.path === '/api/evidence').at(-1).query.get('review_only'), 'false');
-  assert.ok(!h.document.querySelectorAll('[data-view]').some(node => node.dataset.view === 'review'));
+test('material form and details no longer ask users to manage evidence IDs', async () => {
+  const h=await harness();h.app.S.view='materials';await h.app.render();
+  h.app.materialDialog(material({related_evidence_ids:['legacy-id']}));
+  const form=h.document.querySelector('#material-form');
+  assert.equal(form.elements.namedItem('related_evidence_ids'),null);
+  assert.doesNotMatch(form.textContent,/关联证据/);
+  h.handler=(request,fallback)=>request.path==='/api/materials/alpha/material-a'?material({related_evidence_ids:['legacy-id']}):fallback(request);
+  const button=h.document.createElement('button');button.dataset.action='view-material';button.dataset.industry='alpha';button.dataset.id='material-a';h.document.body.append(button);
+  await h.document.dispatch('click',button);
+  assert.equal(h.document.querySelector('[data-action="view-related-evidence"]'),null);
+  assert.doesNotMatch(h.document.querySelector('#dialog-body').textContent,/关联证据/);
 });
+
 
 test('settings source responses stay in their group and active industry', async () => {
   const h = await harness(), pending = deferred();
@@ -718,8 +740,8 @@ test('Agent pending POST is single-flight and old industry conversation is not r
   assert.equal(posts[0].body.conversation, 'conversation-alpha-before');
   assert.equal(posts[1].body.industry, 'beta');
   assert.equal(posts[1].body.conversation, null);
-  assert.equal(posts[1].body.research, false);
-  assert.equal(posts[1].body.allow_source_changes, false);
+  assert.equal(posts[1].body.research, true);
+  assert.equal(posts[1].body.allow_source_changes, true);
   assert.equal(posts[1].init.headers['X-KB-Request'], '1');
 });
 
@@ -846,11 +868,11 @@ test('source dialog preserves opening industry and catalog after settings naviga
   assert.equal(h.app.S.sources.sources[0].id, 'beta-source');
 });
 
-test('research report ignores hidden library query and preserves Agent draft/tree', async () => {
+test('saved reports remain readable without generating evidence briefs or changing Agent draft/tree', async () => {
   const h = await harness();
   const reportPath = 'reports/fixture-only-generated.md';
   h.handler = (request, fallback) => {
-    if (request.path === '/api/reports' && request.method === 'POST') return {path: reportPath};
+    if (request.path === '/api/reports') return [{path:reportPath,title:'已保存的研究报告'}];
     if (request.path === '/api/document') {
       assert.equal(request.query.get('path'), reportPath);
       return {path: reportPath, text: '合成研究简报正文，未读取真实资料。'};
@@ -867,13 +889,12 @@ test('research report ignores hidden library query and preserves Agent draft/tre
   const log = h.document.querySelector('#chat-log');
   const input = h.document.querySelector('#chat-input');
   input.value = '生成简报时保留的未发送草稿';
-  const button = h.document.querySelector('#research-tool-content').querySelectorAll('[data-action]').find(node => node.dataset.action === 'report');
-  assert.ok(button, 'report generation belongs to research outputs');
+  const button = h.document.querySelector('#research-tool-content').querySelectorAll('[data-action]').find(node => node.dataset.action === 'open-doc');
+  assert.ok(button, 'saved reports remain readable in research outputs');
+  assert.equal(h.document.querySelector('[data-action="report"]'),null);
   await h.document.dispatch('click', button);
   const writes = h.calls.filter(call => call.path === '/api/reports' && call.method === 'POST');
-  assert.equal(writes.length, 1);
-  assert.equal(writes[0].body.industry, 'beta');
-  assert.equal(writes[0].body.query, '', 'the unseen library query must not silently filter research output');
+  assert.equal(writes.length, 0);
   assert.equal(h.app.S.q, '某关键词', 'generating a report does not erase the library search');
   assert.equal(h.document.querySelector('#dialog').open, true);
   assert.match(h.document.querySelector('#dialog-body').textContent, /合成研究简报正文/);
@@ -902,7 +923,7 @@ test('material file save is single-flight and commits metadata with the file', a
   assert.equal(writes[0].path,'/api/materials/alpha/import');
   const metadata=JSON.parse(writes[0].body.values.find(([key])=>key==='metadata')[1]);
   assert.equal(metadata.title,'合成批复');
-  assert.equal(metadata.model_allowed,false);
+  assert.equal(metadata.model_allowed,true);
   assert.equal(metadata.id,undefined);
   assert.equal(form.dataset.id,'','no record ID before the combined request succeeds');
   pending.resolve({id:'imported-once'});await first;
@@ -910,6 +931,24 @@ test('material file save is single-flight and commits metadata with the file', a
   assert.equal(form.dataset.saving,'false');
   assert.equal(h.document.querySelector('#dialog').open,false);
   assert.equal(h.errors.length,0);
+});
+
+test('material upload allows exactly 100MB and rejects a larger file without submitting', async () => {
+  const h=await harness();h.app.materialDialog();
+  const form=h.document.querySelector('#material-form');
+  form.elements.namedItem('title').value='合成大附件';
+  assert.match(form.textContent,/100MB以内/);
+  form.elements.namedItem('file').files=[{name:'large.tif',size:100000001}];
+  await h.document.dispatch('submit',form);
+  assert.equal(h.calls.filter(c=>c.path==='/api/materials/alpha/import').length,0);
+  assert.match(form.querySelector('.form-error').textContent,/100MB/);
+  assert.equal(form.querySelector('[type="submit"]').disabled,false);
+  form.elements.namedItem('file').files=[{name:'limit.tif',size:100000000}];
+  h.handler=(request,fallback)=>request.path==='/api/materials/alpha/import'?{id:'large-imported'}:fallback(request);
+  await h.document.dispatch('submit',form);
+  assert.equal(h.calls.filter(c=>c.path==='/api/materials/alpha/import').length,1);
+  assert.equal(form.dataset.id,'large-imported');
+  assert.equal(h.document.querySelector('#dialog').open,false);
 });
 
 test('failed material upload preserves the draft and can be retried once', async () => {
@@ -1138,7 +1177,7 @@ function verification(changes={}) {
     candidates:[{title:'资料记载的计划',summary:'计划建设示范林。',quote:'计划建设示范林',citation:'material-a#block-2-chars-1-12',status:'planned',category:'政策',region:'甲地区'}],
     findings:['需区分计划与项目批复'],coverage_note:'仅抽取部分片段，不代表全文核验。',...changes};
 }
-test('one manual approval automatically extracts evidence with no extra form fields', async()=>{
+test('one manual approval needs no extra form fields or fact review', async()=>{
   const h=await harness(),draft=verification();let approved=false;
   h.app.S.view='materials';
   h.handler=(request,fallback)=>{
@@ -1158,8 +1197,8 @@ test('one manual approval automatically extracts evidence with no extra form fie
   const form=h.document.querySelector('#verification-decision-form');
   assert.equal(form.querySelector('input'),null);assert.equal(form.querySelector('textarea'),null);assert.equal(form.querySelector('select'),null);
   const decisions=h.calls.filter(c=>c.path.endsWith('/decision'));assert.equal(decisions.length,1);assert.deepEqual(decisions[0].body,{decision:'approve'});
-  assert.match(form.textContent,/已提取并入库1条证据/);assert.doesNotMatch(form.textContent,/需区分计划与项目批复/);assert.equal(h.document.querySelector('#dialog').open,false);assert.match(h.document.querySelector('#toast').textContent,/核验已通过，已入库1条证据/);
-  assert.match(h.document.querySelector('#content').textContent,/核验已通过/);
+  assert.match(form.textContent,/资料已审核通过/);assert.doesNotMatch(form.textContent,/需区分计划与项目批复/);assert.equal(h.document.querySelector('#dialog').open,false);assert.match(h.document.querySelector('#toast').textContent,/资料核验已通过，可在知识库查看原文/);
+  assert.match(h.document.querySelector('#content').textContent,/已通过/);
   assert.doesNotMatch(h.document.querySelector('#content').textContent,/有效性待确认/);
   await h.document.dispatch('submit',form);assert.equal(h.calls.filter(c=>c.path.endsWith('/decision')).length,1);
 });
@@ -1175,7 +1214,7 @@ test('automatic verification honors each material permission and displays indepe
   await h.app.render();
   await h.document.dispatch('click',h.document.querySelectorAll('[data-action="verify-material-automatic"]')[1]);
   assert.equal(h.calls.filter(c=>c.path==='/api/verifications/materials').length,0);
-  assert.match(h.document.querySelector('#dialog-body').textContent,/允许模型使用检索片段/);
+  assert.match(h.document.querySelector('#dialog-body').textContent,/加入检索/);
   assert.match(h.document.querySelector('#dialog-body').textContent,/未授权资料/);
   const all=h.document.querySelector('#material-select-all');all.checked=true;await h.document.dispatch('change',all);
   await h.document.dispatch('click',h.document.querySelector('[data-action="verify-selected-automatic"]'));
@@ -1218,7 +1257,7 @@ test('material selection limits each batch to ten and keeps preparation failures
   await h.document.dispatch('click',h.document.querySelector('[data-action="verify-selected-manual"]'));
   assert.equal(h.calls.find(c=>c.path==='/api/verifications/materials').body.items.length,10);
   assert.match(h.document.querySelector('#dialog-body').textContent,/m1：没有原文片段/);assert.equal(h.document.querySelector('#dialog').open,true);
-  assert.match(h.document.querySelector('#verification-results').textContent,/已提取并入库1条证据/);
+  assert.match(h.document.querySelector('#verification-results').textContent,/资料已审核通过/);
 });
 
 test('batch confirmation is a simple list and retry skips successful items',async()=>{
@@ -1236,7 +1275,7 @@ test('batch confirmation is a simple list and retry skips successful items',asyn
   await h.document.dispatch('click',h.document.querySelector('[data-action="preview-verifications"]'));
   const form=h.document.querySelector('#verification-decision-form');assert.equal(form.querySelector('input'),null);assert.equal(form.querySelector('textarea'),null);assert.equal(form.querySelector('[type="submit"]').textContent,'全部通过');
   await h.document.dispatch('submit',form);
-  assert.match(h.document.querySelector('#verification-results').textContent,/合成资料核验：核验已通过/);
+  assert.match(h.document.querySelector('#verification-results').textContent,/合成资料核验：资料已审核通过/);
   assert.match(h.document.querySelector('#verification-results').textContent,/第二份核验：失败，资料版本已变化/);
   secondFails=false;await h.document.dispatch('submit',form);
   assert.equal(h.calls.filter(c=>c.path.includes('review-a/decision')).length,1);assert.equal(h.calls.filter(c=>c.path.includes('review-b/decision')).length,2);
@@ -1277,8 +1316,8 @@ test('extraction failure preserves approval and one retry completes automatic im
     if(request.path.endsWith('/decision')){attempts++;return {...draft,status:'approved',extraction_status:attempts===1?'failed':'completed',extraction_error:attempts===1?'模型暂时不可用':'',evidence_ids:attempts===1?[]:['fact']};}return fallback(request);
   };
   await h.app.render();await h.document.dispatch('click',h.document.querySelector('[data-action="verify-material-manual"]'));
-  const form=h.document.querySelector('#verification-decision-form');assert.match(form.textContent,/资料已通过，证据提取失败，可重试/);assert.doesNotMatch(form.querySelector('#verification-results').textContent,/已入库/);assert.equal(form.querySelector('[type="submit"]').textContent,'重试提取');assert.equal(form.querySelector('[type="submit"]').disabled,false);assert.equal(form.querySelector('[data-action="reject-verifications"]').disabled,true);assert.equal(h.document.querySelector('#dialog').open,true);assert.equal((form.textContent.match(/资料已通过，证据提取失败，可重试/g)||[]).length,1);
-  await h.document.dispatch('submit',form);assert.equal(attempts,2);assert.match(form.textContent,/已提取并入库1条证据/);
+  const form=h.document.querySelector('#verification-decision-form');assert.match(form.textContent,/资料已通过，全文索引未完成，可重试/);assert.doesNotMatch(form.querySelector('#verification-results').textContent,/已入库/);assert.equal(form.querySelector('[type="submit"]').textContent,'重试提取');assert.equal(form.querySelector('[type="submit"]').disabled,false);assert.equal(form.querySelector('[data-action="reject-verifications"]').disabled,true);assert.equal(h.document.querySelector('#dialog').open,true);assert.equal((form.textContent.match(/资料已通过，全文索引未完成，可重试/g)||[]).length,1);
+  await h.document.dispatch('submit',form);assert.equal(attempts,2);assert.match(form.textContent,/资料已审核通过/);
   await h.document.dispatch('submit',form);assert.equal(attempts,2);
 });
 
@@ -1303,10 +1342,10 @@ test('legacy pending approval without a task does not pretend extraction is runn
     if(request.path.endsWith('/decision'))return {...draft,status:'approved',extraction_status:'pending',evidence_ids:[]};return fallback(request);
   };
   // A current-version approval still exposes the restart action when old extraction has no durable task.
-  await h.app.render();assert.match(h.document.querySelector('#content').textContent,/尚无全文提取任务/);assert.ok(h.document.querySelector('[data-action="restart-material-extraction"]'));assert.doesNotMatch(h.document.querySelector('#content').textContent,/正在提取证据/);
+  await h.app.render();assert.match(h.document.querySelector('#content').textContent,/重建全文索引/);assert.ok(h.document.querySelector('[data-action="restart-material-extraction"]'));assert.doesNotMatch(h.document.querySelector('#content').textContent,/正在提取证据/);
   // Reproduce an old approved review result through the normal queue path.
   const pick=h.document.querySelector('[name="material-pick"]');pick.checked=true;await h.document.dispatch('change',pick);await h.document.dispatch('click',h.document.querySelector('[data-action="verify-selected-manual"]'));
-  const form=h.document.querySelector('#verification-decision-form');assert.match(form.textContent,/尚无全文提取任务/);assert.doesNotMatch(form.textContent,/正在提取证据|已完成|未提取到可入库/);assert.equal(form.querySelector('[type="submit"]').disabled,true);assert.equal(form.querySelector('[data-action="refresh-verifications"]').hidden,true);assert.equal(h.calls.filter(c=>c.path.endsWith('/decision')).length,1);
+  const form=h.document.querySelector('#verification-decision-form');assert.match(form.textContent,/重建全文索引/);assert.doesNotMatch(form.textContent,/正在提取证据|已完成|未提取到可入库/);assert.equal(form.querySelector('[type="submit"]').disabled,true);assert.equal(form.querySelector('[data-action="refresh-verifications"]').hidden,true);assert.equal(h.calls.filter(c=>c.path.endsWith('/decision')).length,1);
 });
 
 test('material list and detail show background extraction progress and job controls',async()=>{
@@ -1325,7 +1364,7 @@ test('Agent card approves directly without a second review dialog and is single-
   h.document.querySelector('#chat-input').value='请核验这份资料';await h.app.sendAgent();await h.streams[0].emit({type:'verification_required',id:'review-a',industry_id:'alpha',title:'合成资料'});
   const card=h.document.querySelector('.verification-required');assert.match(card.textContent,/是否通过资料核验/);assert.equal(h.calls.filter(c=>c.path.endsWith('/decision')).length,0);
   const button=card.querySelector('.primary'),first=h.document.dispatch('click',button);await h.document.dispatch('click',button);assert.equal(h.calls.filter(c=>c.path.endsWith('/decision')).length,1);assert.equal(h.document.querySelector('#verification-decision-form'),null);
-  pending.resolve({status:'approved',extraction_status:'completed',evidence_ids:['agent-fact']});await first;assert.match(card.textContent,/已提取并入库1条证据/);assert.equal(button.disabled,true);assert.deepEqual(h.calls.find(c=>c.path.endsWith('/decision')).body,{decision:'approve'});
+  pending.resolve({status:'approved',extraction_status:'completed',evidence_ids:['agent-fact']});await first;assert.match(card.textContent,/资料已审核通过/);assert.equal(button.disabled,true);assert.deepEqual(h.calls.find(c=>c.path.endsWith('/decision')).body,{decision:'approve'});
   const before=h.calls.filter(c=>c.path==='/api/state').length;await h.streams[0].emit({type:'done',archived_ids:[],pending_review_ids:['review-a']});assert.equal(h.calls.filter(c=>c.path==='/api/state').length,before+1);
 });
 
@@ -1341,8 +1380,8 @@ test('Agent extraction failure retries approval and pending extraction never cla
     if(request.path.endsWith('/decision')){attempts++;return {status:'approved',extraction_status:attempts===1?'failed':'pending',extraction_error:attempts===1?'稍后重试':'',evidence_ids:[]};}return fallback(request);
   };
   h.document.querySelector('#chat-input').value='导入资料';await h.app.sendAgent();await h.streams[0].emit({type:'verification_required',id:'review-a',industry_id:'alpha',title:'合成资料'});const card=h.document.querySelector('.verification-required'),button=card.querySelector('.primary');
-  await h.document.dispatch('click',button);assert.equal(button.textContent,'重试提取');assert.match(card.textContent,/资料已通过，证据提取失败，可重试/);
-  await h.document.dispatch('click',button);assert.equal(attempts,2);assert.match(card.textContent,/资料已通过，尚无全文提取任务/);assert.equal(button.textContent,'核验已通过');assert.equal(button.disabled,true);assert.doesNotMatch(card.querySelector('[role="status"]').textContent,/未提取到|已入库|失败/);
+  await h.document.dispatch('click',button);assert.equal(button.textContent,'重试提取');assert.match(card.textContent,/资料已通过，全文索引未完成，可重试/);
+  await h.document.dispatch('click',button);assert.equal(attempts,2);assert.match(card.textContent,/资料已通过，请在资料中重建全文索引/);assert.equal(button.textContent,'核验已通过');assert.equal(button.disabled,true);assert.doesNotMatch(card.querySelector('[role="status"]').textContent,/未提取到|已入库|失败/);
 });
 
 test('verification titles sources findings and Agent card escape active markup without candidate fields',async()=>{
@@ -1355,29 +1394,25 @@ test('verification titles sources findings and Agent card escape active markup w
   assertNoMarkupInjection(h.document.querySelector('#dialog-body'));assert.equal(h.document.querySelector('[data-candidate-field="title"]'),null);assert.match(h.document.querySelector('#dialog-body').textContent,/onerror/);
 });
 
-test('local evidence links back to its material, exact block and related evidence without empty URL links',async()=>{
+test('historical references still open their original material without exposing evidence management',async()=>{
   const h=await harness(),record=evidence({url:'',material_source:{industry_id:'alpha',material_id:'material-a',citation:'material-a#block-2-chars-1-10',quote:'引用原文'},history:[]}),original=material({title:'原始合成资料',content:'引用原文',related_evidence_ids:['evidence-a'],extraction:{text_index:'test-index'}});
-  h.app.S.view='evidence';
   h.handler=(request,fallback)=>{
-    if(request.path==='/api/evidence')return [record];
     if(request.path==='/api/evidence/alpha/evidence-a')return record;
     if(request.path==='/api/materials/alpha/material-a')return original;
     if(request.path==='/api/materials/alpha/material-a/sections')return {total:4,items:[{index:2,first_location:'段落 3',last_location:'段落 4',text:'引用原文'}]};
     return fallback(request);
   };
-  await h.app.render();assert.equal(h.document.querySelector('[data-record]').querySelector('a'),null);
-  await h.document.dispatch('click',h.document.querySelector('[data-record]'));
-  assert.equal(h.document.querySelector('#dialog-body').querySelector('a'),null);
+  const trigger=h.document.createElement('button');trigger.dataset.action='view-related-evidence';trigger.dataset.industry='alpha';trigger.dataset.id='evidence-a';h.document.body.append(trigger);
+  await h.document.dispatch('click',trigger);
   assert.match(h.document.querySelector('#dialog-body').textContent,/material-a#block-2/);
   await h.document.dispatch('click',h.document.querySelector('#locate-evidence-material'));
   assert.equal(h.calls.filter(c=>c.path.endsWith('/sections')).at(-1).query.get('offset'),'1');
-  assert.match(h.document.querySelector('#dialog-body').textContent,/段落 3/);
   await h.document.dispatch('click',h.document.querySelector('#section-back'));
   assert.equal(h.document.querySelector('#dialog-title').textContent,'原始合成资料');
-  await h.document.dispatch('click',h.document.querySelector('[data-action="view-related-evidence"]'));
-  assert.equal(h.document.querySelector('#dialog-title').textContent,'合成证据');
+  assert.equal(h.document.querySelector('#dialog-body').querySelector('[data-action="view-related-evidence"]'),null);
   assert.equal(h.errors.length,0);
 });
+
 
 test('full extraction polls progress in place and preserves an unrelated edit dialog',async()=>{
   const h=await harness(),job=extractionJob(),record=material({verification_status:'reviewed',extraction_job:job});h.app.S.view='materials';
@@ -1453,6 +1488,408 @@ test('hard-chunk index shows full coverage without claiming generated facts or m
   h.app.S.view='materials';h.handler=(request,fallback)=>request.path==='/api/materials'?[record]:request.path==='/api/extractions/alpha/index-material-a'?job:fallback(request);
   await h.app.render();const content=h.document.querySelector('#content');assert.match(content.textContent,/全文已索引/);assert.match(content.textContent,/928 个固定分块/);assert.match(content.textContent,/重建全文索引/);assert.doesNotMatch(content.textContent,/已入库 .* 条证据/);
   await h.document.dispatch('click',content.querySelector('[data-action="view-extraction"]'));const detail=h.document.querySelector('#dialog-body');assert.match(detail.textContent,/导入和建索引不调用模型/);assert.match(detail.textContent,/图片未OCR/);assert.equal(detail.querySelector('[data-action="control-extraction"]'),null);
+});
+
+test('library search displays exact source snippets and opens their original block locally',async()=>{
+  const h=await harness(),quote='赤松密度为每亩七十株。<img src=x onerror=alert(1)>',record=material({content:quote,model_allowed:false,snippets:[{text:quote,location:'正文段落3',citation:'material-a#block-3-chars-1-40'}]});
+  h.handler=(request,fallback)=>{
+    if(request.path==='/api/materials')return [record];
+    if(request.path==='/api/materials/alpha/material-a')return record;
+    if(request.path==='/api/materials/alpha/material-a/sections')return {total:5,items:[{index:3,first_location:'正文段落3',last_location:'正文段落3',text:quote}]};
+    return fallback(request);
+  };
+  h.app.S.view='materials';await h.app.render();
+  const form=h.document.querySelector('#library-search');form.elements.namedItem('q').value='赤松密度';
+  await h.document.dispatch('submit',form);
+  assert.equal(h.calls.filter(c=>c.path==='/api/materials').at(-1).query.get('q'),'赤松密度');
+  assert.match(h.document.querySelector('#content').textContent,/每亩七十株/);
+  assert.match(h.document.querySelector('#content').textContent,/正文段落3/);
+  assertNoMarkupInjection(h.document.querySelector('#content'));
+  await h.document.dispatch('click',h.document.querySelector('[data-action="locate-material-match"]'));
+  const request=h.calls.filter(c=>c.path.endsWith('/sections')).at(-1);
+  assert.equal(request.query.get('offset'),'2');assert.equal(request.query.get('q'),'');
+  assert.match(h.document.querySelector('#dialog-body').textContent,/每亩七十株/);
+  record.snippets[0].citation='material-a#chars-1-40';
+  await h.app.render();await h.document.dispatch('click',h.document.querySelector('[data-action="locate-material-match"]'));
+  assert.equal(h.document.querySelector('#dialog-body details').open,true);
+  assert.equal(h.calls.filter(c=>c.path.includes('/agent/')).length,0);
+  assert.equal(h.errors.length,0);
+});
+
+function savedPage(changes={}) {
+  return {id:'page-one',industry:'alpha',title:'研究展示',tags:['政策'],regions:['甲地区'],summary:'摘要',favorite:false,archived:false,version:1,updated_at:'2026-11-06',warnings:[],history:[{number:1,operation:'create',created_at:'2026-11-06'}],revision:{number:1,created_at:'2026-11-06',content:{title:'研究展示',subtitle:'研究副标题',summary:'已有资料中的记载',summary_references:['ref-one'],audience:'项目负责人',regions:['甲地区'],tags:['政策'],coverage:'只覆盖合成片段',gaps:['缺少实施公告'],blocks:[{kind:'table',title:'政策比较',columns:['政策','进展'],items:[{cells:['甲政策','计划'],nature:'planned',references:['ref-one']}]}]},sources:[{ref:'ref-one',kind:'material',id:'material-a',industry_id:'alpha',title:'原始资料',text:'原文引用',citation:'material-a#block-3-chars-1-4',checked_date:'2026-10-18',url:'javascript:alert(1)'}]},...changes};
+}
+test('page library filters and empty state stay local and do not invoke a model',async()=>{
+  const h=await harness();h.app.S.view='pages';await h.app.render();
+  assert.match(h.document.querySelector('#content').textContent,/还没有匹配/);
+  h.handler=(request,fallback)=>request.path==='/api/pages'?[savedPage()]:fallback(request);
+  const form=h.document.querySelector('#page-filter');form.elements.namedItem('q').value='政策';
+  await h.document.dispatch('submit',form);
+  for(let i=0;i<15;i++)await Promise.resolve();
+  assert.equal(h.calls.filter(c=>c.path==='/api/pages').at(-1).query.get('q'),'政策');
+  assert.match(h.document.querySelector('#content').textContent,/研究展示/);
+  assert.equal(h.calls.filter(c=>c.path.includes('/agent/')).length,0);
+});
+test('saved page reader escapes content and opens exact source block without a model call',async()=>{
+  const h=await harness(),page=savedPage();page.revision.content.summary='<img src=x onerror=alert(1)>';
+  h.handler=(request,fallback)=>{
+    if(request.path==='/api/pages/page-one')return page;
+    if(request.path==='/api/materials/alpha/material-a')return material({extraction:{text_index:'text/index.json'}});
+    if(request.path.endsWith('/sections'))return {total:4,items:[{index:3,text:'原文引用'}]};
+    return fallback(request);
+  };
+  await h.app.openResearchPage('page-one');assertNoMarkupInjection(h.document.querySelector('#content'));
+  await h.document.dispatch('click',h.document.querySelector('[data-page-ref]'));
+  assert.match(h.document.querySelector('#dialog-body').textContent,/原文引用/);
+  assert.equal(h.document.querySelector('#dialog-body a'),null);
+  await h.document.dispatch('click',h.document.querySelector('#page-original'));
+  assert.equal(h.calls.at(-1).query.get('offset'),'2');
+  assert.equal(h.calls.filter(c=>c.path.includes('/agent/')).length,0);
+});
+test('page generation is opt-in and result events open a saved artifact across navigation',async()=>{
+  const h=await harness();h.handler=(request,fallback)=>request.path==='/api/agent/jobs'?{id:'page-job',conversation:'page-conversation'}:request.path==='/api/pages/page-one'?savedPage():fallback(request);
+  await h.app.pageComposer({prompt:'整理政策对比',industry:'alpha'});
+  h.document.querySelector('#page-request').value='整理政策对比';
+  await h.document.dispatch('submit',h.document.querySelector('#page-compose'));
+  assert.equal(h.calls.find(c=>c.path==='/api/agent/jobs').body.generate_page,true);
+  assert.equal(h.calls.find(c=>c.path==='/api/agent/jobs').body.research,true);
+  await h.streams[0].emit({type:'page_saved',page:savedPage()});
+  await h.streams[0].emit({type:'answer',text:'已整理'});
+  await h.streams[0].emit({type:'done',status:'completed'});
+  await h.document.dispatch('click',h.document.querySelector('[data-page-saved]'));
+  assert.equal(h.app.S.view,'pages');assert.match(h.document.querySelector('#content').textContent,/核心发现/);
+  await h.document.dispatch('click',h.document.querySelector('[data-page-command="present"]'));
+  assert.equal(h.document.body.classList.contains('page-present'),true);
+  await h.document.dispatch('keydown',h.document.body,{key:'Escape'});
+  assert.equal(h.document.body.classList.contains('page-present'),false);
+});
+test('page update sends original archive and version, and metadata conflict preserves saved page',async()=>{
+  const h=await harness();h.handler=(request,fallback)=>{
+    if(request.path==='/api/pages/page-one')return savedPage();
+    if(request.path==='/api/agent/jobs')return {id:'update-job',conversation:'update-conversation'};
+    return fallback(request);
+  };
+  await h.app.openResearchPage('page-one');h.app.S.industry='beta';
+  await h.app.pageCommand('layout');h.document.querySelector('#page-request').value='增加卡片';
+  await h.document.dispatch('submit',h.document.querySelector('#page-compose'));
+  const body=h.calls.find(c=>c.path==='/api/agent/jobs').body;
+  assert.equal(body.industry,'alpha');assert.equal(body.page_id,'page-one');assert.equal(body.page_version,1);assert.equal(body.page_operation,'layout');
+});
+test('late page-library response cannot replace a newer destination',async()=>{
+  const h=await harness(),pending=deferred();h.handler=(request,fallback)=>request.path==='/api/pages'?pending.promise:fallback(request);
+  h.app.S.view='pages';const old=h.app.render();h.app.S.view='materials';await h.app.render();pending.resolve([savedPage()]);await old;
+  assert.equal(h.app.S.view,'materials');assert.equal(h.document.querySelector('.page-grid'),null);
+});
+test('page copy requests one artifact and opens the copy; metadata actions are single-flight',async()=>{
+  const h=await harness(),pending=deferred();let copied=false;
+  h.handler=(request,fallback)=>{
+    if(request.path==='/api/pages/page-one')return savedPage();
+    if(request.path==='/api/pages/page-copy')return savedPage({id:'page-copy',title:'研究展示 · 副本'});
+    if(request.path==='/api/pages/page-one/copy'){copied=true;return {id:'page-copy'};}
+    if(request.path==='/api/pages/page-copy/metadata')return pending.promise;
+    return fallback(request);
+  };
+  await h.app.openResearchPage('page-one');await h.app.pageCommand('copy');
+  assert.equal(copied,true);assert.equal(h.app.P.id,'page-copy');
+  const first=h.app.pageCommand('favorite');await h.app.pageCommand('favorite');
+  assert.equal(h.calls.filter(c=>c.path==='/api/pages/page-copy/metadata').length,1);
+  h.app.S.view='materials';await h.app.render();pending.resolve({id:'page-copy'});await first;
+  assert.equal(h.app.S.view,'materials');assert.equal(h.app.P.mutating,false);
+});
+test('newer page filter wins over a slower previous filter',async()=>{
+  const h=await harness(),pending=deferred();h.app.S.view='pages';
+  h.handler=(request,fallback)=>request.path==='/api/pages'?(request.query.get('q')==='old'?pending.promise:[savedPage({title:'新搜索结果'})]):fallback(request);
+  h.app.P.q='old';const old=h.app.renderPages();h.app.P.q='new';await h.app.renderPages();pending.resolve([savedPage({title:'旧搜索结果'})]);await old;
+  assert.match(h.document.querySelector('#content').textContent,/新搜索结果/);
+  assert.doesNotMatch(h.document.querySelector('#content').textContent,/旧搜索结果/);
+});
+
+test('page overflow actions keep accessible names and close on Escape or action selection',async()=>{
+  const h=await harness();h.handler=(request,fallback)=>request.path==='/api/pages/page-one'?savedPage():fallback(request);
+  await h.app.openResearchPage('page-one');const menu=h.document.querySelector('.page-more'),summary=menu.querySelector('summary');
+  const rename=menu.querySelector('[data-page-command="rename"]');assert.equal(rename.getAttribute('aria-label'),'重命名');
+  menu.open=true;await h.document.dispatch('keydown',summary,{key:'Escape'});
+  assert.equal(menu.open,false);assert.equal(h.document.activeElement,summary);
+  menu.open=true;await h.document.dispatch('click',rename);
+  assert.equal(menu.open,false);assert.equal(h.document.querySelector('#dialog').open,true);
+  assert.match(h.document.querySelector('#dialog-title').textContent,/重命名/);
+  assert.equal(h.calls.filter(c=>c.path.includes('/agent/')).length,0);
+});
+
+function savedVisualPage(kind='flow'){
+  const page=savedPage(), c=page.revision.content;
+  c.schema_version=2;c.question='如何理解系统？';c.theme='sage';c.layout='story';c.scenes=[{
+    id:'main',kind,title:'研究路线',lead:'从观测到理解',direction:'horizontal',emphasis:'primary',
+    nodes:[{id:'input',label:'输入',detail:'观测信号',icon:'sensor',nature:'reported',references:['ref-one']},
+      {id:'model',label:'模型',detail:'数据建模',icon:'layers',nature:'inference',references:['ref-one']},
+      {id:'output',label:'结果',detail:'状态估计',icon:'battery',nature:'reported',references:['ref-one']}],
+    edges:[{source:'input',target:'model',label:'输入模型',relation:'input',nature:'inference',references:['ref-one']},
+      {source:'model',target:'output',label:'输出估计',relation:'output',nature:'inference',references:['ref-one']}],
+    dimensions:[],cells:[]
+  }];
+  if(kind==='comparison'){
+    c.scenes[0].nodes=c.scenes[0].nodes.slice(0,2);c.scenes[0].edges=[];
+    c.scenes[0].dimensions=[{id:'role',label:'作用'}];c.scenes[0].cells=[
+      {node:'input',dimension:'role',text:'采集原始数据',nature:'reported',references:['ref-one']},
+      {node:'model',dimension:'role',text:'解释数据关系',nature:'inference',references:['ref-one']}];
+  }
+  return page;
+}
+test('visual flow selects nodes, highlights relations and steps through real details locally',async()=>{
+  const h=await harness();h.handler=(r,f)=>r.path==='/api/pages/page-one'?savedVisualPage():f(r);
+  await h.app.openResearchPage('page-one');
+  const next=h.document.querySelector('[data-visual-step="1"]'),prev=h.document.querySelector('[data-visual-step="-1"]');
+  assert.equal(prev.disabled,true);
+  await h.document.dispatch('click',next);
+  assert.equal(h.document.querySelector('[data-visual-node="model"]').getAttribute('aria-pressed'),'true');
+  assert.match(h.document.querySelector('.visual-detail').textContent,/数据建模/);
+  assert.match(h.document.querySelector('.visual-detail').textContent,/输出估计/);
+  await h.document.dispatch('click',next);assert.equal(next.disabled,true);
+  assert.equal(h.calls.filter(c=>c.path.includes('/agent/')).length,0);
+});
+test('visual comparison changes selected alternative and keeps matching dimensions visible',async()=>{
+  const h=await harness();h.handler=(r,f)=>r.path==='/api/pages/page-one'?savedVisualPage('comparison'):f(r);
+  await h.app.openResearchPage('page-one');
+  await h.document.dispatch('click',h.document.querySelector('[data-visual-node="model"]'));
+  const selected=h.document.querySelectorAll('.visual-comparison-value').find(element=>element.classList.contains('is-selected'));
+  assert.match(selected.textContent,/解释数据关系/);
+  assert.match(h.document.querySelector('.visual-comparison').textContent,/采集原始数据/);
+  assert.equal(h.document.querySelector('.visual-graph'),null);
+});
+test('selected visual scene edit binds exact scene archive and version to the next job',async()=>{
+  const h=await harness();h.handler=(r,f)=>r.path==='/api/pages/page-one'?savedVisualPage():r.path==='/api/agent/jobs'?{id:'visual-job',conversation:'visual-chat'}:f(r);
+  await h.app.openResearchPage('page-one');
+  await h.document.dispatch('click',h.document.querySelector('[data-edit-scene="main"]'));
+  h.document.querySelector('#page-request').value='改成结构图';
+  await h.document.dispatch('submit',h.document.querySelector('#page-compose'));
+  const body=h.calls.find(c=>c.path==='/api/agent/jobs').body;
+  assert.equal(body.page_scene_id,'main');assert.equal(body.page_version,1);assert.equal(body.page_id,'page-one');assert.equal(body.page_operation,'layout');
+});
+test('visual content is escaped and source navigation remains available in selected-node detail',async()=>{
+  const h=await harness(),page=savedVisualPage(),attack='<img src=x onerror=alert(1)>';
+  page.revision.content.scenes[0].nodes[0].label=attack;page.revision.content.scenes[0].nodes[0].detail=attack;
+  h.handler=(r,f)=>r.path==='/api/pages/page-one'?page:f(r);
+  await h.app.openResearchPage('page-one');assertNoMarkupInjection(h.document.querySelector('#content'));
+  assert.match(h.document.querySelector('.visual-detail').textContent,/onerror/);
+  assert.ok(h.document.querySelector('.visual-detail [data-page-ref]'));
+});
+
+test('unfinished page drafts are separate from artifacts and resume the exact checkpoint',async()=>{
+  const h=await harness(),draft={id:'draft-one',industry:'alpha',title:'未完成的研究页',status:'paused',completed:1,total:3,failures:{second:{quarantined:true}},research:false};
+  h.handler=(r,f)=>r.path==='/api/page-drafts'?[draft]:r.path==='/api/agent/jobs'?{id:'resumed-job',conversation:'resumed-chat'}:f(r);
+  h.app.S.view='pages';await h.app.render();
+  assert.match(h.document.querySelector('.page-drafts').textContent,/已通过 1 \/ 3/);
+  assert.match(h.document.querySelector('.page-drafts').textContent,/错误场景已隔离/);
+  assert.equal(h.calls.filter(c=>c.path.includes('/agent/')).length,0);
+  await h.document.dispatch('click',h.document.querySelector('[data-resume-draft]'));
+  const request=h.calls.find(c=>c.path==='/api/agent/jobs').body;
+  assert.equal(request.resume_draft_id,'draft-one');assert.equal(request.industry,'alpha');
+  assert.equal(request.generate_page,true);assert.equal(request.research,false);
+});
+test('paused streamed generation offers continuation and never labels a draft as a saved page',async()=>{
+  const h=await harness();h.handler=(r,f)=>r.path==='/api/agent/jobs'?{id:'paused-job',conversation:'paused-chat'}:f(r);
+  h.document.querySelector('#chat-input').value='生成展示页';await h.app.sendAgent();
+  const draft={id:'checkpoint',industry:'alpha',title:'研究草稿',status:'paused',completed:2,total:3};
+  await h.streams[0].emit({type:'page_draft',draft});
+  await h.streams[0].emit({type:'done',status:'paused',draft});
+  assert.equal(h.document.querySelector('[data-page-saved]'),null);
+  assert.match(h.document.querySelector('.page-draft-progress').textContent,/全部通过后保存成品/);
+  const resume=h.document.querySelectorAll('button').find(b=>b.textContent==='继续未完成部分');
+  assert.ok(resume);assert.equal(h.app.S.job,null);
+  await h.document.dispatch('click',resume);
+  assert.equal(h.calls.filter(c=>c.path==='/api/agent/jobs').at(-1).body.resume_draft_id,'checkpoint');
+});
+
+test('category bars and numeric lines retain real labels coordinates and original values',async()=>{
+  const h=await harness();h.handler=(r,f)=>r.path==='/api/agent/jobs'?{id:'quant-job',conversation:'quant-chat'}:f(r);
+  h.document.querySelector('#chat-input').value='比较实验结果';await h.app.sendAgent();
+  const bars=figure('bar');Object.assign(bars,{axis:'category',period:'同一实验',nature:'reported'});
+  bars.items=[{...bars.items[0],label:'算法A',date:null,value:1.2},{...bars.items[2],label:'算法B',date:null,value:2.4}];
+  await h.streams[0].emit({type:'chart',seq:1,chart:bars});
+  let graph=h.document.querySelector('.research-chart');assert.match(graph.textContent,/类别比较/);assert.match(graph.textContent,/算法A/);
+  await h.document.dispatch('click',graph.querySelector('.chart-source-button'));
+  assert.match(h.document.querySelector('#dialog-body').textContent,/同一实验/);assert.doesNotMatch(graph.textContent,/日期未知/);
+  const line=figure('line');Object.assign(line,{axis:'number',period:'循环实验',x_metric:'循环次数',x_unit:'次',nature:'reported'});
+  line.items=line.items.map((p,i)=>({...p,date:null,x:[1,10,100][i],value:[3,2,1][i]}));
+  await h.streams[0].emit({type:'chart',seq:2,chart:line});
+  graph=h.document.querySelectorAll('.research-chart')[1];
+  const xs=graph.querySelectorAll('.chart-node circle').map(el=>Number(el.getAttribute('cx')));
+  assert.ok(xs[2]-xs[1]>8*(xs[1]-xs[0]));assert.match(graph.textContent,/循环次数/);
+  assert.ok(!/NaN|Infinity/.test(graph.innerHTML));
+});
+
+test('pie uses deterministic shares zero sectors and source disclosure and rejects partial totals',async()=>{
+  const h=await harness();h.handler=(r,f)=>r.path==='/api/agent/jobs'?{id:'pie-job',conversation:'pie-chat'}:f(r);
+  h.document.querySelector('#chat-input').value='样本组成';await h.app.sendAgent();
+  const pie=figure('bar');Object.assign(pie,{kind:'pie',axis:'category',period:'年度样本',nature:'reported',whole:'完整样本',total:100,unit:'个'});
+  pie.items=pie.items.map((p,i)=>({...p,date:null,label:['正常','异常','未定'][i],value:[80,20,0][i]}));
+  await h.streams[0].emit({type:'chart',seq:1,chart:pie});
+  const graph=h.document.querySelector('.research-chart');assert.equal(graph.querySelectorAll('.chart-node').length,2);
+  assert.equal(graph.querySelectorAll('.chart-pie-entry').length,3);assert.match(graph.textContent,/80.00%/);assert.match(graph.textContent,/0.00%/);
+  await h.document.dispatch('click',graph.querySelector('.chart-pie-entry'));
+  assert.match(h.document.querySelector('#dialog-body').textContent,/占比 80.00%/);
+  assert.ok(!/NaN|Infinity/.test(graph.innerHTML));pie.total=120;
+  await h.streams[0].emit({type:'chart',seq:2,chart:pie});assert.equal(h.document.querySelectorAll('.research-chart').length,1);
+});
+
+test('visual table renders exact mixed metrics and accessible cell references without a graph',async()=>{
+  const h=await harness(),page=savedVisualPage('comparison'),scene=page.revision.content.scenes[0];scene.kind='table';
+  scene.dimensions=[{id:'rmse',label:'RMSE（%）'},{id:'r2',label:'R²（无量纲）'}];
+  scene.cells=scene.nodes.flatMap((n,i)=>scene.dimensions.map((d,j)=>({node:n.id,dimension:d.id,text:[[1.2,.98],[2.4,.95]][i][j]+'',nature:'reported',references:['ref-one']})));
+  h.handler=(r,f)=>r.path==='/api/pages/page-one'?page:f(r);await h.app.openResearchPage('page-one');
+  const table=h.document.querySelector('.visual-data-table');assert.ok(table);assert.equal(table.querySelectorAll('td').length,4);
+  assert.match(table.textContent,/RMSE（%）/);assert.match(table.textContent,/0.98/);
+  assert.equal(h.document.querySelector('.visual-graph'),null);assert.equal(h.document.querySelector('.visual-detail'),null);
+  await h.document.dispatch('click',table.querySelector('[data-page-ref]'));assert.equal(h.document.querySelector('#dialog').open,true);
+  assert.equal(h.errors.length,0);
+});
+
+test('personal page requests select an authorized material before any model call',async()=>{
+  const h=await harness();h.handler=(r,f)=>r.path==='/api/materials'?[material({model_allowed:true,sensitivity:'public',title:'电池论文'}),material({id:'restricted',model_allowed:true,sensitivity:'restricted',title:'受限资料'})]:r.path==='/api/agent/jobs'?{id:'scoped-job',conversation:'scoped-chat'}:f(r);
+  h.document.querySelector('#chat-input').value='把我的毕设整理成一个前端页面';await h.app.sendAgent();
+  assert.ok(h.document.querySelector('#page-compose'));assert.equal(h.calls.filter(c=>c.path==='/api/agent/jobs').length,0);
+  assert.match(h.document.querySelector('#page-material-choices').textContent,/电池论文/);assert.doesNotMatch(h.document.querySelector('#page-material-choices').textContent,/受限资料/);
+  await h.document.dispatch('submit',h.document.querySelector('#page-compose'));
+  assert.equal(h.calls.filter(c=>c.path==='/api/agent/jobs').length,0);
+  h.document.querySelector('[data-page-material]').checked=true;
+  await h.document.dispatch('submit',h.document.querySelector('#page-compose'));
+  const body=h.calls.find(c=>c.path==='/api/agent/jobs').body;
+  assert.deepEqual(body.page_materials,[{industry_id:'alpha',id:'material-a'}]);assert.equal(body.generate_page,true);
+});
+
+test('late material selection cannot replace another open dialog',async()=>{
+  const h=await harness(),pending=deferred();h.handler=(r,f)=>r.path==='/api/materials'?pending.promise:f(r);
+  const opening=h.app.pageComposer({prompt:'整理研究',industry:'alpha'});
+  await h.app.pageComposer({prompt:'保留这里',operation:'layout'});pending.resolve([material({model_allowed:true})]);await opening;
+  assert.equal(h.document.querySelector('#dialog-title').textContent,'调整展示');assert.match(h.document.querySelector('#dialog-body').textContent,/保留这里/);
+});
+
+test('legacy ambiguous drafts reselect materials instead of repeating a wrong plan',async()=>{
+  const h=await harness(),draft={id:'old-draft',industry:'alpha',title:'旧方案',status:'paused',completed:2,total:3,failures:{},needs_material_selection:true,request:'把我的毕业设计整理成网页'};
+  h.handler=(r,f)=>r.path==='/api/page-drafts'?[draft]:r.path==='/api/materials'?[material({model_allowed:true,title:'电池论文'})]:f(r);
+  h.app.S.view='pages';await h.app.render();await h.document.dispatch('click',h.document.querySelector('[data-resume-draft]'));
+  assert.ok(h.document.querySelector('#page-compose'));assert.match(h.document.querySelector('#page-material-choices').textContent,/电池论文/);
+  assert.equal(h.calls.filter(c=>c.path==='/api/agent/jobs').length,0);
+});
+
+test('industry selection persists immediately and failed selection keeps the prior industry',async()=>{
+  const h=await harness(),picker=h.document.querySelector('#industry-select');
+  picker.value='beta';await h.document.dispatch('change',picker);
+  assert.equal(h.state.active_industry,'beta');assert.equal(h.app.S.industry,'beta');
+  assert.deepEqual(h.calls.find(c=>c.path==='/api/active-industry').body,{id:'beta'});
+  await h.app.refresh();assert.equal(picker.value,'beta');
+  h.handler=(r,f)=>{if(r.path==='/api/active-industry')throw new Error('模拟保存失败');return f(r);};
+  picker.value='alpha';await h.document.dispatch('change',picker);
+  assert.equal(picker.value,'beta');assert.equal(h.app.S.industry,'beta');assert.equal(picker.disabled,false);
+});
+
+test('retrieval switch is on the card and single-flight without review or closing a newer draft',async()=>{
+  const h=await harness(),pending=deferred();let record=material();
+  h.handler=(r,f)=>r.path==='/api/materials'?[record]:r.path.endsWith('/retrieval')?pending.promise:f(r);
+  h.app.S.view='materials';await h.app.render();
+  const button=h.document.querySelector('[data-action="toggle-material-retrieval"]');
+  assert.equal(button.closest('details'),null);assert.equal(button.getAttribute('aria-checked'),'false');
+  const first=h.document.dispatch('click',button);await h.document.dispatch('click',button);
+  assert.equal(h.calls.filter(c=>c.path.endsWith('/retrieval')).length,1);
+  assert.deepEqual(h.calls.find(c=>c.path.endsWith('/retrieval')).body,{enabled:true});
+  h.app.materialDialog({title:'正在编辑的另一份资料'});const draft=h.document.querySelector('#material-form');
+  record=material({model_allowed:true,extraction_job:{mode:'hard_chunk_index',status:'completed',indexed_chunks:3}});
+  pending.resolve(record);await first;
+  assert.equal(h.document.querySelector('#material-form'),draft);assert.equal(h.document.querySelector('#dialog').open,true);
+  assert.equal(h.document.querySelector('[data-action="toggle-material-retrieval"]').getAttribute('aria-checked'),'true');
+  assert.equal(h.calls.filter(c=>c.path.includes('/verifications')).filter(c=>c.method==='POST').length,0);
+});
+
+test('failed retrieval update keeps its prior state and can retry',async()=>{
+  const h=await harness();let fail=true;
+  h.handler=(r,f)=>{if(r.path==='/api/materials')return [material()];if(r.path.endsWith('/retrieval')){if(fail)throw new Error('模拟写入失败');return material({model_allowed:true});}return f(r);};
+  h.app.S.view='materials';await h.app.render();const button=h.document.querySelector('[data-action="toggle-material-retrieval"]');
+  await h.document.dispatch('click',button);assert.equal(button.disabled,false);assert.equal(button.getAttribute('aria-checked'),'false');
+  fail=false;await h.document.dispatch('click',button);assert.equal(h.calls.filter(c=>c.path.endsWith('/retrieval')).length,2);
+  assert.match(h.document.querySelector('#toast').textContent,/已加入检索/);
+});
+
+test('import choice is prominent and Agent defaults require no permission checkboxes',async()=>{
+  const h=await harness();h.app.materialDialog();const form=h.document.querySelector('#material-form');
+  assert.equal(form.elements.namedItem('model_allowed').checked,true);
+  assert.equal(form.querySelector('.material-advanced').querySelector('[name="model_allowed"]'),null);
+  assert.equal(h.document.querySelector('#research-mode'),null);assert.equal(h.document.querySelector('#source-changes'),null);
+  h.document.querySelector('#dialog').close();
+  h.handler=(r,f)=>r.path==='/api/agent/jobs'?{id:'default-job',conversation:'default-chat'}:f(r);
+  h.document.querySelector('#chat-input').value='查资料，但不要归档';await h.app.sendAgent();
+  const request=h.calls.find(c=>c.path==='/api/agent/jobs');
+  assert.equal(request.body.research,true);assert.equal(request.body.allow_source_changes,true);
+  assert.equal(request.body.prompt,'查资料，但不要归档');
+});
+
+test('industry manager is directly accessible and filters cards without changing the current industry',async()=>{
+  const h=await harness();await h.document.querySelector('#industry-manager').onclick();
+  for(let i=0;i<20;i++)await Promise.resolve();
+  assert.equal(h.app.S.view,'settings');assert.equal(h.document.querySelector('#settings-archives').parentElement.open,true);
+  const search=h.document.querySelector('#industry-search');search.value='beta';search.oninput();
+  const cards=h.document.querySelectorAll('[data-managed-industry]');
+  assert.equal(cards.find(c=>c.dataset.managedIndustry==='alpha').hidden,true);
+  assert.equal(cards.find(c=>c.dataset.managedIndustry==='beta').hidden,false);
+  assert.equal(h.app.S.industry,'alpha');
+});
+
+test('industry delete previews counts and cancelling never writes',async()=>{
+  const h=await harness();h.app.S.view='settings';
+  h.handler=(r,f)=>r.path.endsWith('/deletion-preview')?{id:'alpha',name:'甲地区',management_token:'a'.repeat(64),material_count:2,page_count:3,draft_count:1,is_current:true,shared_with:[{id:'beta',name:'乙地区'}]}:f(r);
+  await h.app.render();await h.document.dispatch('click',h.document.querySelector('[data-action="delete-industry"]'));
+  const form=h.document.querySelector('#industry-delete-form');assert.match(form.textContent,/2 份资料 · 3 个页面/);assert.doesNotMatch(form.textContent,/共享基础行业/);assert.match(form.textContent,/全部行业/);
+  h.document.querySelector('#cancel-industry-delete').onclick();assert.equal(h.document.querySelector('#dialog').open,false);
+  assert.equal(h.calls.filter(c=>c.path.endsWith('/manage')).length,0);
+});
+
+test('deleting current industry is single-flight and moves it to recoverable trash',async()=>{
+  const h=await harness(),pending=deferred(),token='a'.repeat(64);h.app.S.view='settings';
+  h.handler=(r,f)=>r.path.endsWith('/deletion-preview')?{id:'alpha',name:'甲地区',management_token:token,material_count:1,page_count:0,draft_count:0,is_current:true,shared_with:[]}:r.path.endsWith('/manage')?pending.promise:f(r);
+  await h.app.render();await h.document.dispatch('click',h.document.querySelector('[data-action="delete-industry"]'));
+  const form=h.document.querySelector('#industry-delete-form'),first=form.onsubmit({preventDefault(){}});await form.onsubmit({preventDefault(){}});
+  assert.equal(h.calls.filter(c=>c.path.endsWith('/manage')).length,1);
+  const alpha=h.state.industries.shift();h.state.active_industry=null;h.state.deleted_industries=[{...alpha,enabled:false,management_token:'b'.repeat(64)}];pending.resolve({});await first;
+  assert.equal(h.app.S.industry,'all');assert.equal(h.document.querySelector('#dialog').open,false);
+  assert.ok(h.document.querySelector('[data-action="restore-industry"]'));
+  assert.deepEqual(h.calls.find(c=>c.path.endsWith('/manage')).body,{action:'delete',expected_token:token});
+});
+
+test('industry rename failures keep the name draft and restoration does not pick a current industry',async()=>{
+  const h=await harness();h.app.S.view='settings';h.state.industries[0].management_token='a'.repeat(64);h.state.deleted_industries=[{id:'old-one',name:'可恢复行业',management_token:'b'.repeat(64),enabled:false}];
+  h.handler=(r,f)=>{if(r.path.endsWith('/manage')){if(r.body.action==='rename')throw new Error('行业状态已变化');h.state.deleted_industries=[];return {};}return f(r);};
+  await h.app.refresh();await h.document.dispatch('click',h.document.querySelector('[data-action="rename-industry"]'));
+  const form=h.document.querySelector('#industry-rename-form');form.elements.namedItem('name').value='用户尚未保存的新名称';await form.onsubmit({preventDefault(){}});
+  assert.equal(h.document.querySelector('#dialog').open,true);assert.equal(form.elements.namedItem('name').value,'用户尚未保存的新名称');assert.match(form.querySelector('.industry-form-error').textContent,/状态已变化/);
+  h.document.querySelector('#dialog').close();await h.document.dispatch('click',h.document.querySelector('[data-action="restore-industry"]'));
+  assert.equal(h.app.S.industry,'alpha');assert.equal(h.calls.at(-1).method,'GET');
+  assert.equal(h.calls.find(c=>c.body?.action==='restore').body.expected_token,'b'.repeat(64));
+});
+
+test('late industry delete preview cannot replace a newer user dialog',async()=>{
+  const h=await harness(),pending=deferred();h.app.S.view='settings';h.handler=(r,f)=>r.path.endsWith('/deletion-preview')?pending.promise:f(r);
+  await h.app.render();const opening=h.document.dispatch('click',h.document.querySelector('[data-action="delete-industry"]'));
+  h.app.materialDialog({title:'新的资料草稿'});const draft=h.document.querySelector('#material-form');pending.resolve({id:'alpha',name:'过期预览'});await opening;
+  assert.equal(h.document.querySelector('#material-form'),draft);assert.equal(h.document.querySelector('#industry-delete-form'),null);
+});
+
+test('generic industry creation has one entry and submits no specialty template',async()=>{
+  const h=await harness();h.app.S.view='settings';
+  h.handler=(r,f)=>{if(r.path==='/api/industries'&&r.method==='POST'){h.state.industries.push({id:r.body.id,name:r.body.name,scope:{primary_region:r.body.region,topics:[]},update_state:{},enabled:false});return {};}return f(r);};
+  await h.app.render();assert.equal(h.document.querySelector('[data-action="add-forestry-region"]'),null);
+  await h.document.dispatch('click',h.document.querySelector('[data-action="add-industry"]'));
+  const form=h.document.querySelector('#industry-form');form.elements.namedItem('id').value='generic-new';form.elements.namedItem('name').value='电池研究';
+  await h.document.dispatch('submit',form);
+  const body=h.calls.find(c=>c.path==='/api/industries'&&c.method==='POST').body;
+  assert.equal(body.name,'电池研究');assert.equal(Object.hasOwn(body,'specialty'),false);
+});
+
+test('legacy specialty flags do not change the generic material editor or add GIS fields',async()=>{
+  const h=await harness();h.app.materialDialog({id:'existing',industry_id:'national',title:'普通研究报告'});
+  assert.equal(h.document.querySelector('#dialog-title').textContent,'编辑资料');
+  const form=h.document.querySelector('#material-form');
+  for(const field of ['scale','coordinate_system','resolution'])assert.equal(form.elements.namedItem(field),null);
+  assert.doesNotMatch(form.textContent,/全国基础资料|造林|林草地区/);
+  assert.ok(form.elements.namedItem('model_allowed'));
 });
 
 (async () => {

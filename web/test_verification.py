@@ -219,6 +219,29 @@ class VerificationTests(Fixture, unittest.TestCase):
         self.assertEqual(next_result['material_id'], result['material_id'])
         self.assertEqual(len(self.knowledge.list('alpha')), 1)
 
+    def test_normal_web_approval_indexes_material_without_creating_or_changing_facts(self):
+        quote = '公开原文独有内容，供本机检索引用。'
+        page = {'url': self.record['url'], 'title': '公开资料原文', 'text': quote,
+            'checked_date': self.record['checked_date']}
+        before = {p: p.read_bytes() for p in (self.store.home('alpha') / 'evidence').glob('*') if p.is_file()}
+        review = self.queue.prepare_web('alpha', {**self.record, 'quote': quote}, page)
+        response = self.client.post('/api/verifications/alpha/' + review['id'] + '/decision', json={'decision': 'approve'})
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        self.assertEqual(result['evidence_ids'], [])
+        self.assertEqual(result['extraction_status'], 'indexed')
+        self.assertEqual(result['extraction_job']['mode'], 'hard_chunk_index')
+        material = self.knowledge.get('alpha', result['material_id'])
+        self.assertEqual(material['verification']['status'], 'reviewed')
+        self.assertIn(quote, material['content'])
+        self.assertEqual(material['related_evidence_ids'], [])
+        after = {p: p.read_bytes() for p in (self.store.home('alpha') / 'evidence').glob('*') if p.is_file()}
+        self.assertEqual(after, before)
+        repeated = self.client.post('/api/verifications/alpha/' + review['id'] + '/decision', json={'decision': 'approve'})
+        self.assertEqual(repeated.status_code, 200)
+        self.assertEqual(repeated.json()['material_id'], result['material_id'])
+        self.assertEqual(len(self.knowledge.list('alpha')), 1)
+
     def test_public_web_cannot_overwrite_another_source_id(self):
         record = {**self.record, 'url': 'https://another.example.org/report', 'quote': '公开原文内容'}
         page = {'url': record['url'], 'title': '原文', 'text': record['quote'], 'checked_date': self.record['checked_date']}
@@ -228,20 +251,20 @@ class VerificationTests(Fixture, unittest.TestCase):
         self.assertFalse(self.knowledge.list('alpha'))
         self.assertEqual(self.queue.get('alpha', review['id'])['status'], 'pending')
 
-    def test_queue_includes_shared_national_reviews_but_not_other_regions(self):
-        for key, region in (('national', '全国'), ('region-local', '本地区'), ('region-other', '其他地区')):
-            result = self.client.post('/api/industries', json={'id': key, 'name': region + '林草',
-                'region': region, 'specialty': 'forestry'})
-            self.assertEqual(result.status_code, 200, result.text)
-        self.store.save_scope('national', {'library_role': 'national-foundation'})
-        for industry in ('national', 'region-other'):
-            self.knowledge.save(industry, {'id': 'regional-doc', 'title': '范围测试资料', 'content': '资料中的计划内容。'})
-            self.queue.prepare_material(industry, 'regional-doc')
-        reviews = self.queue.list('region-local')
-        self.assertEqual([review['industry_id'] for review in reviews], ['national'])
-        self.queue.decide('national', reviews[0]['id'], {'decision': 'approve'})
-        self.assertEqual(len(self.store.evidence('region-local')), 0)
-        self.assertEqual(len(self.store.evidence('national')), 1)
+    def test_queue_is_industry_scoped_and_all_is_explicit(self):
+        for key in ('reference','region-local','region-other'):
+            result=self.client.post('/api/industries',json={'id':key,'name':key,'region':'测试地区'})
+            self.assertEqual(result.status_code,200,result.text)
+        for industry in ('reference','region-other'):
+            self.knowledge.save(industry,{'id':'regional-doc','title':'范围测试资料','content':'资料中的计划内容。'})
+            self.queue.prepare_material(industry,'regional-doc')
+        self.assertEqual(self.queue.list('region-local'),[])
+        reviews=self.queue.list('all')
+        self.assertEqual({r['industry_id'] for r in reviews},{'reference','region-other'})
+        selected=next(r for r in reviews if r['industry_id']=='reference')
+        self.queue.decide('reference',selected['id'],{'decision':'approve'})
+        self.assertEqual(len(self.store.evidence('region-local')),0)
+        self.assertEqual(len(self.store.evidence('reference')),1)
 
     def test_public_web_approval_rechecks_latest_source_policy(self):
         quote = self.record['summary']
