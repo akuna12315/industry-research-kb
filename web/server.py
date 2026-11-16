@@ -23,6 +23,7 @@ from .full_extraction import FullExtractionRuntime
 from .material_index import MaterialIndex
 from .research_pages import ResearchPages
 from .page_recovery import PageDrafts
+from .document_processing import DocumentProcessing
 
 WEB = Path(__file__).resolve().parent
 
@@ -95,6 +96,7 @@ def create_app(root=None):
     verifications = VerificationQueue(store)
     extractions = FullExtractionRuntime(store, runtime)
     material_index = MaterialIndex(store)
+    documents = DocumentProcessing(store)
     pages = ResearchPages(store)
     material_extraction_locks = {}
 
@@ -102,8 +104,10 @@ def create_app(root=None):
     async def lifespan(app):
         # The old model extraction manifests are history only. Build a local
         # fixed-size index for opted-in material, without any model requests.
+        documents.restore()
         await material_index.restore()
         yield
+        await documents.close()
         await extractions.close()
         tasks = [*runtime.tasks.values(), *network.tasks.values()]
         for task in tasks:
@@ -111,6 +115,8 @@ def create_app(root=None):
                 task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        from .retrieval import close_models
+        await asyncio.to_thread(close_models, store.root)
 
     app = FastAPI(title='Industry Atlas', lifespan=lifespan)
     app.state.store = store
@@ -120,6 +126,7 @@ def create_app(root=None):
     app.state.verifications = verifications
     app.state.extractions = extractions
     app.state.material_index = material_index
+    app.state.documents = documents
     app.state.pages = pages
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=['127.0.0.1', 'localhost', '[::1]', 'testserver'])
     app.add_middleware(BodyLimit)
@@ -256,11 +263,19 @@ def create_app(root=None):
     @app.get('/api/materials')
     def materials(industry: str = 'all', q: str = '', kind: str = ''):
         matches = {(r['industry_id'], r['id']): r for r in material_index.search(
-            industry, q, limit=100, candidate_limit=120, model_only=False, kind=kind)} if q.strip() else {}
+            industry, q, limit=100, candidate_limit=120, model_only=False, kind=kind, fuzzy=True)} if q.strip() else {}
+        catalog = knowledge.list(industry, '', kind)
+        if q.strip():
+            literal = {(r['industry_id'], r['id']) for r in knowledge.list(industry, q, kind)}
+            catalog = [r for r in catalog if (r['industry_id'], r['id']) in matches or (r['industry_id'], r['id']) in literal]
+            catalog.sort(key=lambda r: -max((s.get('retrieval_score', 0) for s in
+                matches.get((r['industry_id'], r['id']), {}).get('snippets', [])), default=0))
         return [{k: v for k, v in r.items() if k != 'content'} | {
             'extraction_job': material_index.latest(r['industry_id'], r['id']),
+            'retrieval_method': matches.get((r['industry_id'], r['id']), {}).get('retrieval_method'),
+            'retrieval_note': matches.get((r['industry_id'], r['id']), {}).get('retrieval_note', ''),
             'snippets': match['snippets'] if (match := matches.get((r['industry_id'], r['id'])))
-                and match['source_fingerprint'] == kb.material_fingerprint(r) else []} for r in knowledge.list(industry, q, kind)
+                and match['source_fingerprint'] == kb.material_fingerprint(r) else []} for r in catalog
                 if not q.strip() or r.get('model_allowed') and r.get('sensitivity') != 'restricted']
 
     def indexed_material(record):
@@ -326,6 +341,40 @@ def create_app(root=None):
     def material_file(industry: str, key: str):
         path, name = knowledge.attachment(industry, key)
         return FileResponse(path, filename=name)
+
+    @app.get('/api/materials/{industry}/{key}/document')
+    def material_document(industry:str,key:str):
+        return {'analysis':documents.analysis(industry,key),
+            'jobs':[job for job in documents.list(industry) if job['material_id']==key]}
+
+    @app.post('/api/materials/{industry}/{key}/document/process')
+    async def material_document_process(industry:str,key:str,payload:dict):
+        return documents.start(industry,key,payload)
+
+    @app.post('/api/materials/{industry}/{key}/document/calculate')
+    def material_document_calculate(industry:str,key:str,payload:dict):
+        return documents.compute(industry,key,payload)
+
+    @app.get('/api/materials/{industry}/{key}/document/figures/{figure_id}')
+    def material_document_figure(industry:str,key:str,figure_id:str):
+        return FileResponse(documents.asset(industry,key,figure_id),media_type='image/png')
+
+    @app.get('/api/materials/{industry}/{key}/document/export')
+    def material_document_export(industry:str,key:str,format:str='json'):
+        analysis=documents.analysis(industry,key)
+        if not analysis or analysis.get('status')=='invalidated':raise ValueError('当前版本尚无图表处理结果')
+        if format=='json':return JSONResponse(analysis,headers={'Content-Disposition':f'attachment; filename="{key}-structure.json"'})
+        if format!='markdown':raise ValueError('支持JSON或Markdown导出')
+        from .table_structure import markdown
+        content='\n\n'.join('## '+t['caption']+'\n\n'+markdown(t,100000)+'\n\n'+'\n'.join(t['notes']) for t in analysis['tables'])
+        return PlainTextResponse('图表结构化解析；未核验，保留原文定位。\n\n'+content,
+            headers={'Content-Disposition':f'attachment; filename="{key}-tables.md"'})
+
+    @app.get('/api/document-jobs/{job_id}')
+    def document_job(job_id:str):return documents.get(job_id)
+
+    @app.post('/api/document-jobs/{job_id}/control')
+    async def document_job_control(job_id:str,payload:dict):return documents.control(job_id,payload.get('action'))
 
     @app.get('/api/materials/{industry}/{key}/sections')
     def material_sections(industry:str,key:str,q:str='',offset:int=0,limit:int=5):
@@ -422,7 +471,7 @@ def create_app(root=None):
     @app.post('/api/industries/{industry}/manage')
     async def industry_manage(industry: str, payload: IndustryManagement):
         if payload.action == 'delete' and any(not task.done() for task in
-                [*runtime.tasks.values(), *network.tasks.values(), *extractions.tasks.values()]):
+                [*runtime.tasks.values(), *network.tasks.values(), *extractions.tasks.values(), *documents.tasks.values()]):
             raise ValueError('仍有研究、采集或提取任务运行，请结束任务后再删除行业')
         # Keep the busy check and registry transition in the same event-loop
         # turn as Agent/crawl starts. No file trees are moved or removed.

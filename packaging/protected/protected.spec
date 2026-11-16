@@ -12,7 +12,7 @@ if len(native) != 1:
 datas = [(str(stage / 'web/static'), 'web/static'), (str(stage / 'README.txt'), '.'),
          (str(root / 'web/skills/research-visual-report'), 'web/skills/research-visual-report'),
          (str(stage / 'THIRD-PARTY-NOTICES.txt'), '.')]
-for package in ('ddgs', 'primp', 'genai_prices'):
+for package in ('ddgs', 'primp', 'genai_prices','rapidocr'):
     datas += collect_data_files(package)
 for distribution in ('pydantic-ai-slim', 'ddgs', 'genai-prices'):
     datas += copy_metadata(distribution)
@@ -21,7 +21,7 @@ a = Analysis([str(stage / 'protected_core.py')], pathex=[str(stage), str(stage /
     hiddenimports=collect_submodules('ddgs') + ['uvicorn.logging', 'uvicorn.loops.asyncio',
         'uvicorn.protocols.http.h11_impl', 'uvicorn.lifespan.on'],
     hookspath=[], hooksconfig={}, runtime_hooks=[],
-    excludes=['pytest', 'IPython', 'numpy', 'pandas', 'matplotlib', 'scipy', 'torch',
+    excludes=['pytest', 'IPython', 'pandas', 'matplotlib', 'scipy', 'torch',
               'tensorflow', 'notebook', 'jupyter', 'web.test_web'], noarchive=False)
 own = lambda name: name in {'kb','workspace','protected_core'} or name == 'web' or name.startswith('web.')
 a.pure = [item for item in a.pure if not own(item[0])]

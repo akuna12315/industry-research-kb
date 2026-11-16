@@ -1,6 +1,6 @@
 """Fixed error messages and bounded SDK metadata; never persist model content."""
 from pydantic_ai import UnexpectedModelBehavior
-from pydantic_ai.messages import ModelResponse, RetryPromptPart, ToolCallPart
+from pydantic_ai.messages import ModelResponse, RetryPromptPart, ToolCallPart, TextPart, ThinkingPart
 
 TOOLS = {'inspect_industry', 'search_materials', 'search_evidence', 'list_review_due',
          'read_user_memory', 'search_web', 'crawl_public_sources', 'read_public_source',
@@ -15,7 +15,8 @@ FIELDS = {'page', 'chart', 'title', 'subtitle', 'summary', 'summary_references',
           'support_ref',
           'description', 'query', 'record', 'url', 'indices', 'plan', 'scene', 'scenes',
           'nodes', 'edges', 'source', 'target', 'relation', 'dimensions', 'dimension', 'node',
-          'id', 'icon', 'group', 'detail', 'question', 'theme', 'layout', 'direction', 'emphasis'}
+          'id', 'icon', 'group', 'detail', 'question', 'theme', 'layout', 'direction', 'emphasis',
+          'claims', 'support_ids', 'insufficient', 'limitation'}
 ERRORS = {'missing', 'extra_forbidden', 'literal_error', 'string_too_long', 'string_too_short',
           'list_too_long', 'list_too_short', 'json_invalid', 'value_error', 'int_type',
           'float_type', 'finite_number', 'model_type', 'list_type', 'string_type'}
@@ -38,6 +39,9 @@ def failure_diagnostics(exc, messages=(), page=False):
         diagnostic['response_count'] = len(responses)
         diagnostic['last_tools'] = [p.tool_name if p.tool_name in TOOLS else 'unknown_tool'
                                     for p in last.parts if isinstance(p, ToolCallPart)][:6]
+        diagnostic['visible_text_characters'] = sum(len(p.content) for p in last.parts if isinstance(p,TextPart))
+        diagnostic['thinking_parts'] = sum(isinstance(p,ThinkingPart) for p in last.parts)
+        diagnostic['empty_visible_responses'] = sum(not any(isinstance(p,TextPart) and p.content.strip() for p in r.parts) for r in responses)
     if retries:
         retry = retries[-1]
         diagnostic['retry_count'] = len(retries)
@@ -51,6 +55,9 @@ def failure_diagnostics(exc, messages=(), page=False):
         else:
             # Validation text can include user data. Categorize without retaining it.
             text = str(retry.content)
+            diagnostic['grounding_errors'] = [code for code in (
+                'missing_support','missing_limitation','unknown_support','generated_locator',
+                'unsupported_number','global_absence','question_as_fact','non_contiguous_quote') if code+':' in text]
             diagnostic['validation_kind'] = next((code for words, code in (
                 (('chart_ref', '引用', 'references'), 'citation'),
                 (('日期', 'date'), 'date'), (('数值', '口径'), 'metric'),

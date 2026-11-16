@@ -118,6 +118,27 @@ class DeepSeekCompatibilityTests(Fixture, unittest.IsolatedAsyncioTestCase):
                 {'protocol': 'responses'}):
             self.assertNotIn('openai_reasoning_effort', configured_model_settings({**cfg, **changes}))
 
+    async def test_bonsai_keeps_medium_thinking_and_compatible_sampler(self):
+        from pydantic_ai import Agent
+        cfg = {**self.runtime.config(), 'base_url': 'http://127.0.0.1:8092/v1',
+               'protocol': 'chat_completions', 'model': 'bonsai-2-27b-abliterated-v2'}
+        requests = []
+        def respond(request):
+            requests.append(json.loads(request.content))
+            return httpx.Response(200, json={'id': 'synthetic-bonsai', 'object': 'chat.completion',
+                'created': 1, 'model': cfg['model'], 'choices': [{'index': 0, 'finish_reason': 'stop',
+                    'message': {'role': 'assistant', 'content': '4', 'reasoning_content': 'synthetic'}}]})
+        async with AsyncOpenAI(api_key='local', base_url=cfg['base_url'],
+                http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond))) as client:
+            result = await Agent(configured_model(cfg, client)).run('2+2',
+                model_settings=configured_model_settings(cfg, 256))
+        self.assertEqual(result.output, '4')
+        self.assertEqual(requests[0]['reasoning_effort'], 'medium')
+        self.assertEqual(requests[0]['temperature'], 1.0)
+        self.assertEqual(requests[0]['top_p'], .95)
+        self.assertEqual(requests[0]['top_k'], 20)
+        self.assertNotIn('thinking_budget', requests[0])
+
     async def test_fixed_error_diagnostics_never_echo_provider_body(self):
         class Failure(Exception):
             status_code = 400

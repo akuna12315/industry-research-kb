@@ -149,10 +149,37 @@ class MaterialIndexTests(Fixture, unittest.TestCase):
         def respond(messages, info):
             self.assertFalse(info.function_tools)
             self.assertIn('七十株', str(messages))
-            return ModelResponse(parts=[TextPart('资料记载赤松密度为每亩七十株。[M1]')])
+            import json
+            from pydantic_ai.messages import UserPromptPart
+            request=next(p.content for m in reversed(messages) for p in m.parts if isinstance(p,UserPromptPart))
+            supports=json.loads(request)['supports']
+            key=next(s['id'] for s in supports if '七十株' in s['text'])
+            return ModelResponse(parts=[TextPart(json.dumps({'insufficient':False,'claims':[{'text':'资料记载赤松密度为每亩七十株。','support_ids':[key]}],'limitation':''},ensure_ascii=False))])
         with patch.object(runtime, 'rerank_materials', new=AsyncMock(return_value=records)):
             result = asyncio.run(runtime.answer_material_question('赤松密度', ResearchContext(self.store, 'alpha'),
                 runtime.config(), answer_model=FunctionModel(respond)))
         self.assertIn('每亩七十株', result['text'])
-        self.assertIn(records[0]['snippets'][0]['citation'], result['text'])
+        self.assertIn('full-plan#chars-', result['text'])
+        self.assertIn('尾章独有赤松密度参数为每亩七十株。',result['text'])
         self.assertEqual(len(self.store.evidence('alpha')), 1)
+
+    def test_direct_answer_handles_unknown_local_reranker_usage(self):
+        from unittest.mock import AsyncMock, patch
+        from pydantic_ai.messages import TextPart
+        self.material()
+        runtime = AgentRuntime(self.store)
+        records = self.index.search('alpha', '赤松密度')
+        records[0]['ranking_usage'] = {'requests': 1, 'tokens': None, 'local': True, 'local_requests': 12}
+        def respond(messages, info):
+            import json
+            from pydantic_ai.messages import UserPromptPart
+            request=next(p.content for m in reversed(messages) for p in m.parts if isinstance(p,UserPromptPart))
+            key=next(s['id'] for s in json.loads(request)['supports'] if '七十株' in s['text'])
+            return ModelResponse(parts=[TextPart(json.dumps({'insufficient':False,'claims':[{'text':'资料记载赤松密度为每亩七十株。','support_ids':[key]}],'limitation':''},ensure_ascii=False))])
+        with patch.object(runtime, 'rerank_materials', new=AsyncMock(return_value=records)):
+            result = asyncio.run(runtime.answer_material_question('赤松密度', ResearchContext(self.store, 'alpha'),
+                runtime.config(), answer_model=FunctionModel(respond)))
+        self.assertIn('每亩七十株', result['text'])
+        self.assertEqual(result['token_usage_scope'], 'answer_only')
+        self.assertEqual(result['local_rerank_requests'], 12)
+        self.assertEqual(result['requests'], 1)

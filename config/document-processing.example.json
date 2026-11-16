@@ -1,0 +1,12 @@
+{
+  "vision": {
+    "enabled": false,
+    "url": "http://127.0.0.1:8770",
+    "model": "qwen3-vl-2b-instruct-local",
+    "binary": "",
+    "library_directory": "work/retrieval-cuda",
+    "weights": "work/document-models/Qwen3VL-2B-Instruct-Q4_K_M.gguf",
+    "projector": "work/document-models/mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf",
+    "threads": 6
+  }
+}

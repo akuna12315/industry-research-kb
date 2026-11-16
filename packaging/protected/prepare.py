@@ -9,8 +9,9 @@ ROOT = Path(__file__).resolve().parents[2]
 WORK = ROOT / 'work/protected'
 STAGE = WORK / 'source'
 MODULES = ('__init__', 'agent_runtime', 'charts', 'docx_index', 'extraction_model', 'extraction_source',
-           'full_extraction', 'knowledge', 'material_index', 'network', 'server', 'service', 'verification',
-           'research_pages', 'visual_pages', 'page_recovery', 'model_diagnostics', 'visual_skill', 'page_scope', 'visual_supports')
+           'full_extraction', 'knowledge', 'material_index', 'retrieval', 'network', 'server', 'service', 'verification',
+           'research_pages', 'visual_pages', 'page_recovery', 'model_diagnostics', 'visual_skill', 'page_scope', 'visual_supports',
+           'source_support','process_identity','table_structure','document_parse','document_ocr','document_vision','document_processing')
 SOURCES = [*(f'web/{name}.py' for name in MODULES), 'scripts/kb.py', 'scripts/workspace.py',
            'packaging/desktop_app.py']
 

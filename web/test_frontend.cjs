@@ -10,6 +10,7 @@ const source = fs.readFileSync(path.join(__dirname, 'static', 'app.js'), 'utf8')
 const chartSource = fs.readFileSync(path.join(__dirname, 'static', 'research-charts.js'), 'utf8');
 const pageSource = fs.readFileSync(path.join(__dirname, 'static', 'research-pages.js'), 'utf8');
 const visualSource = fs.readFileSync(path.join(__dirname, 'static', 'visual-pages.js'), 'utf8');
+const documentSource = fs.readFileSync(path.join(__dirname, 'static', 'document-tools.js'), 'utf8');
 const html = fs.readFileSync(path.join(__dirname, 'static', 'index.html'), 'utf8');
 const clone = value => structuredClone(value);
 const decode = value => value.replace(/&(?:amp|lt|gt|quot|#39);/g, token => ({
@@ -276,7 +277,7 @@ async function harness(evaluatedSource = source) {
       return {ok: true, status: 200, json: async () => clone(value)};
     }
   });
-  vm.runInContext(chartSource + '\n' + evaluatedSource + '\n' + visualSource + '\n' + pageSource + '\n;globalThis.__frontend = {S, P, render, renderSources, sourceDialog, materialDialog, sendAgent, refresh, esc, safeURL, markdown, renderPages, openResearchPage, pageComposer, pageCommand};', context, {filename: 'app.js'});
+  vm.runInContext(chartSource + '\n' + evaluatedSource + '\n' + visualSource + '\n' + pageSource + '\n'+documentSource+'\n;globalThis.__frontend = {S, P, render, renderSources, sourceDialog, materialDialog, sendAgent, refresh, esc, safeURL, markdown, renderPages, openResearchPage, pageComposer, pageCommand,openDocumentTools,documentTableMarkup};', context, {filename: 'app.js'});
   h.app = context.__frontend;
   // Initial refresh is the production boot path; wait for its finite microtasks.
   for (let index = 0; index < 20; ++index) await Promise.resolve();
@@ -1890,6 +1891,41 @@ test('legacy specialty flags do not change the generic material editor or add GI
   for(const field of ['scale','coordinate_system','resolution'])assert.equal(form.elements.namedItem(field),null);
   assert.doesNotMatch(form.textContent,/全国基础资料|造林|林草地区/);
   assert.ok(form.elements.namedItem('model_allowed'));
+});
+
+test('document previews preserve merged headers and escape source text',async()=>{
+  const h=await harness(),host=h.document.createElement('div');
+  const cells=[{id:'a',row:1,column:1,row_span:2,column_span:1,text:'地区'},
+    {id:'b',row:1,column:2,row_span:1,column_span:2,text:'销售额（万元）'},
+    {id:'c',row:2,column:2,row_span:1,column_span:1,text:'2023'},
+    {id:'d',row:2,column:3,row_span:1,column_span:1,text:'2024'},
+    {id:'e',row:3,column:1,row_span:1,column_span:1,text:'<img src=x onerror=bad>'},
+    {id:'f',row:3,column:2,row_span:1,column_span:1,text:'120'},
+    {id:'g',row:3,column:3,row_span:1,column_span:1,text:''}];
+  host.innerHTML=h.app.documentTableMarkup({id:'t',caption:'合成表格',rows:3,columns:3,header_rows:2,
+    quality:'parsed_not_verified',header_detection:'native_or_user',notes:[],cells,grid:[['a','b','b'],['a','c','d'],['e','f','g']]});
+  assert.equal(host.querySelector('[rowspan="2"]').getAttribute('rowspan'),'2');
+  assert.equal(host.querySelector('[colspan="2"]').getAttribute('colspan'),'2');
+  assert.match(host.textContent,/空白 \/ 未披露/);assertNoMarkupInjection(host);
+});
+
+test('document processing POST is single-flight and late result cannot reopen a different dialog',async()=>{
+  const h=await harness(),pending=deferred();
+  h.handler=(r,fallback)=>{
+    if(r.path==='/api/materials/alpha/document-test')return {id:'document-test',industry_id:'alpha',title:'合成图表',model_allowed:true};
+    if(r.path==='/api/materials/alpha/document-test/document')return {analysis:null,jobs:[]};
+    if(r.path.endsWith('/document/process'))return pending.promise;
+    return fallback(r);
+  };
+  await h.app.openDocumentTools('alpha','document-test');
+  const form=h.document.querySelector('#document-process-form');
+  const first=h.document.dispatch('submit',form);for(let i=0;i<20;i++)await Promise.resolve();
+  const second=h.document.dispatch('submit',form);for(let i=0;i<20;i++)await Promise.resolve();
+  assert.equal(h.calls.filter(c=>c.path.endsWith('/document/process')).length,1);
+  h.app.materialDialog({id:'another',industry_id:'alpha',title:'另一份资料'});
+  pending.resolve({id:'document-fixture',status:'queued'});await Promise.all([first,second]);
+  assert.equal(h.document.querySelector('#dialog-title').textContent,'编辑资料');
+  assert.equal(h.document.querySelector('#material-form').elements.namedItem('title').value,'另一份资料');
 });
 
 (async () => {

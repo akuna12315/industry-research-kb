@@ -2,7 +2,7 @@
 
 const P={id:null,revision:null,q:'',region:'',tag:'',archived:false,favorite:false,page:null,mutating:false,load:0};
 const pageNature={reported:'来源记载',planned:'计划 / 目标',inference:'分析推断',unknown:'待查明'};
-const pageOperation={create:'生成页面',layout:'调整展示',refresh:'更新研究',metadata:'页面信息',restore:'恢复历史',copy:'复制页面'};
+const pageOperation={create:'生成页面（简约版）',layout:'调整展示',refresh:'更新研究',metadata:'页面信息',restore:'恢复历史',copy:'复制页面'};
 const pageDate=value=>String(value||'').slice(0,16).replace('T',' ');
 async function resumePageDraft(draft){
   if(S.job||S.sending){toast('请等待当前任务完成或先停止任务');return;}
@@ -19,7 +19,7 @@ function pageAction(command,label,icon,variant='secondary',attributes=''){
   return `<button class="${variant} ui-control" data-page-command="${command}" aria-label="${esc(label)}" ${attributes}>${uiIcon(icon)}<span>${esc(label)}</span></button>`;
 }
 function pageLibraryHeader(items){
-  return `<div class="page-heading page-library-heading"><div><div class="page-kicker">${uiIcon('document')} 研究成果</div><h1>页面库</h1><p>为每一次研究，留下一份清晰的表达。</p></div><button class="primary" id="new-research-page">${uiIcon('sparkles')}<span>生成展示页</span></button></div>
+  return `<div class="page-heading page-library-heading"><div><div class="page-kicker">${uiIcon('document')} 研究成果 · 简约版</div><h1>页面库</h1><p>聚焦核心内容，用图表与结构清晰呈现。</p></div><button class="primary" id="new-research-page">${uiIcon('sparkles')}<span>生成展示页 · 简约版</span></button></div>
     <form id="page-filter" class="page-filters"><div class="page-search-field">${uiIcon('search')}<input name="q" type="search" aria-label="搜索页面" placeholder="搜索标题、摘要或标签…" value="${esc(P.q)}"></div>
     <div class="page-filter-options"><div class="page-filter-fields"><label>地区<input name="region" aria-label="地区" placeholder="全部地区" value="${esc(P.region)}"></label><label>标签<input name="tag" aria-label="标签" placeholder="全部标签" value="${esc(P.tag)}"></label></div>
     <div class="page-filter-chips"><label class="page-filter-chip"><input name="favorite" type="checkbox" ${P.favorite?'checked':''}>${uiIcon('star')}<span>收藏</span></label><label class="page-filter-chip"><input name="archived" type="checkbox" ${P.archived?'checked':''}>${uiIcon('archive')}<span>已归档</span></label></div><button class="secondary page-filter-submit">${uiIcon('filter')}<span>筛选</span></button></div></form>
@@ -41,7 +41,7 @@ function pageRequestNeedsSelection(prompt){
 }
 async function pageComposer({prompt='',industry=S.industry,page=null,operation='create',sceneId=null}={}){
   if(S.job||S.sending){toast('请等待当前任务完成或先停止任务');return;}
-  const mode=sceneId?'调整选中图形':operation==='create'?'生成可视化页面':pageOperation[operation];
+  const mode=sceneId?'调整选中图形':operation==='create'?'生成可视化页面 · 简约版':pageOperation[operation];
   dialog(mode,`<form id="page-compose"><label>展示要求<textarea id="page-request" rows="5" required maxlength="10000" placeholder="主题、展示对象、重点问题和风格，例如：面向项目负责人的政策对比页">${esc(prompt)}</textarea></label><div id="page-material-choices" class="page-material-choices">${operation==='create'?'正在读取可用资料…':'沿用原页面的资料范围。'}</div><p class="description">选择资料后仅使用这些资料；“我的毕设”等要求需要选定对象。全部校验通过后保存；出错时保留草稿。</p><div class="dialog-actions"><button class="primary" type="submit" id="page-generate-submit" ${operation==='create'?'disabled':''}>${esc(mode)}</button></div></form>`);
   const form=$('#page-compose');let catalog=[];
   form.onsubmit=async e=>{

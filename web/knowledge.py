@@ -97,6 +97,11 @@ class Knowledge:
             raise ValueError('已建立原文分段索引，正文需重新上传附件更新；资料说明请使用摘要（summary）或备注（notes）。')
         if redact(record['summary'] + record['content']) != record['summary'] + record['content']:
             raise ValueError('资料不保存API密钥或访问令牌，请先移除密钥')
+        if (attachment is None and extraction is None and old.get('extraction',{}).get('document_analysis')
+                and kb.material_fingerprint(old)!=kb.material_fingerprint(record)):
+            native=old['extraction'].get('native_text_index')
+            record['extraction']={k:v for k,v in old['extraction'].items() if k not in ('document_analysis','document_processing','native_text_index','text_index')}
+            if native:record['extraction']['text_index']=native
         if old and kb.material_fingerprint(old) != kb.material_fingerprint(record):
             previous = old.get('verification') or {}
             if previous.get('status') in ('pending', 'reviewed', 'invalidated'):
@@ -280,7 +285,7 @@ class Knowledge:
         if metadata is not None and (self.folder(industry) / (key + '.json')).exists():
             record = {**self.get(industry, key), **metadata}
         suffix = Path(filename).suffix.lower()
-        supported = ('.txt', '.md', '.csv', '.pdf', '.docx', '.png', '.jpg', '.jpeg', '.tif', '.tiff', '.geojson', '.zip')
+        supported = ('.txt', '.md', '.csv', '.pdf', '.docx', '.xlsx', '.html', '.htm', '.png', '.jpg', '.jpeg', '.tif', '.tiff', '.geojson', '.zip')
         if len(raw) > MAX_UPLOAD_BYTES or suffix not in supported:
             raise ValueError('支持100MB以内文字文档、PDF、DOCX及常见附件')
         if suffix=='.docx':
@@ -340,7 +345,7 @@ class Knowledge:
     def attachment(self, industry, key):
         record = self.get(industry, key)
         attachment = record.get('attachment')
-        if not attachment or attachment['suffix'] not in ('.txt', '.md', '.csv', '.pdf', '.docx', '.png', '.jpg', '.jpeg', '.tif', '.tiff', '.geojson', '.zip'):
+        if not attachment or attachment['suffix'] not in ('.txt', '.md', '.csv', '.pdf', '.docx', '.xlsx', '.html', '.htm', '.png', '.jpg', '.jpeg', '.tif', '.tiff', '.geojson', '.zip'):
             raise ValueError('没有可下载附件')
         name = attachment.get('storage_name', key + attachment['suffix'])
         if Path(name).name != name or '/' in name or '\\' in name:

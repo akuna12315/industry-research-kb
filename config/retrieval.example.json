@@ -1,0 +1,31 @@
+{
+  "enabled": false,
+  "mode": "hybrid",
+  "candidate_limit": 48,
+  "branch_limit": 40,
+  "final_limit": 6,
+  "rrf_k": 60,
+  "context_chars": 2200,
+  "query_instruction": "Given a question, retrieve passages that directly answer it.",
+  "embedding": {
+    "url": "http://127.0.0.1:8767",
+    "model": "qwen3-embedding-0.6b-q8_0",
+    "dimension": 1024,
+    "file": "work/retrieval-models/Qwen3-Embedding-0.6B-Q8_0.gguf",
+    "revision": ""
+  },
+  "reranker": {
+    "url": "http://127.0.0.1:8768",
+    "model": "qwen3-reranker-0.6b-q8_0",
+    "file": "work/retrieval-models/qwen3-reranker-0.6b-q8_0.gguf",
+    "revision": ""
+  },
+  "runtime": {
+    "auto_start": false,
+    "binary": "",
+    "library_directory": "work/retrieval-cuda",
+    "require_gpu": false,
+    "gpu_layers": 0,
+    "threads": 6
+  }
+}
